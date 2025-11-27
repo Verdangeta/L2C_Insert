@@ -181,6 +181,10 @@ class TSPTester():
 
             state, reward, reward_student, done = self.env.pre_step()  # state: data, first_node = current_node
 
+            # RTDL caching: store features for the current batch
+            rtdl_features_cache = None
+            update_RTD = self.model_params.get('update_RTD', 1)
+
             while not done:
                 # print('  ')
                 # print('******************************************************************************')
@@ -204,13 +208,36 @@ class TSPTester():
                     # print(Manhattan_Distance.shape)
                     random_index = torch.argmin(Manhattan_Distance, dim=1).reshape(batch_size, 1)  # [B]
 
+                    # Update RTDL features cache if needed
+                    if self.model.with_RTDL:
+                        # Check if we need to recompute RTDL(current_solution, Full_Graph)
+                        # Update only when: (1) step is multiple of update_RTD, or (2) cache is None
+                        should_update = (
+                            (current_step % update_RTD == 0) or 
+                            (rtdl_features_cache is None)
+                        )
+                        
+                        if should_update:
+                            # Compute RTDL(current_solution, Full_Graph) for current partial solution
+                            # Returns list of dicts: [{(u, v): weight}, ...] for each batch item
+                            rtdl_features_cache = self.model.compute_rtdl_features(
+                                state.data, self.env.abs_partial_solu_2)
+                        
+                        # Extract RTDL weights for current partial solution edges from cache
+                        # Uses cached weights if available, otherwise 0
+                        rtdl_weights = self.model.extract_rtdl_weights_for_edges(
+                            rtdl_features_cache, self.env.abs_partial_solu_2)
+                    else:
+                        rtdl_weights = None
+
                     abs_partial_solu_2, abs_scatter_solu_1, abs_scatter_solu_1_seleted = self.model(state.data,
                                                                                                     self.env.solution,
                                                                                                     self.env.abs_scatter_solu_1,
                                                                                                     self.env.abs_partial_solu_2,
                                                                                                     random_index,
                                                                                                     current_step,
-                                                                                                    last_node_index)
+                                                                                                    last_node_index,
+                                                                                                    rtdl_features=rtdl_weights)
                     last_node_index = abs_scatter_solu_1_seleted
                 current_step += 1
 

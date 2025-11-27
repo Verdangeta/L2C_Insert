@@ -65,7 +65,8 @@ model_params = {
     'knearest': False,
     'k_nearest_edges': 100,
     'k_nearest_scatter': 100,
-    'coor_norm': False
+    'coor_norm': False,
+    'debug_mode': DEBUG_MODE
 }
 
 tester_params = {

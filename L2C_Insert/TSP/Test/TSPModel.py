@@ -5,6 +5,7 @@ import math
 import numpy as np
 import os
 import matplotlib.pyplot as plt
+from L2C_Insert.TSP.utils.RTD_Lite_TSP import RTD_Lite, prim_algo
 
 
 class TSPModel(nn.Module):
@@ -13,6 +14,7 @@ class TSPModel(nn.Module):
         super().__init__()
         self.model_params = model_params
         self.mode = model_params['mode']
+        self.with_RTDL = model_params.get('with_RTDL', False)
         self.encoder = TSP_Encoder(**model_params)
         self.decoder = TSP_Decoder(**model_params)
         self.encoded_nodes = None
@@ -20,12 +22,13 @@ class TSPModel(nn.Module):
 
 
     def forward(self, data, abs_solution, abs_scatter_solu_1, abs_partial_solu_2, random_index,
-                current_step, last_node_index):
+                current_step, last_node_index, rtdl_features=None):
 
         batch_size_V = data.shape[0]
         problem_size = data.shape[1]
+        device = data.device
 
-        self.index_gobal = torch.arange(batch_size_V,dtype=torch.long)[:,None]
+        self.index_gobal = torch.arange(batch_size_V, dtype=torch.long, device=device)[:,None]
 
 
 
@@ -40,7 +43,10 @@ class TSPModel(nn.Module):
                                             abs_partial_solu_2, abs_scatter_solu_1_seleted, batch_size_V, problem_size)
 
 
-            probs = self.decoder(self.encoded_nodes, abs_partial_solu_2, abs_scatter_solu_1_seleted,abs_scatter_solu_1_unseleted)
+            # Use provided rtdl_features or compute if not provided
+            if self.with_RTDL and rtdl_features is None:
+                rtdl_features = self.compute_rtdl_features(data, abs_partial_solu_2)
+            probs = self.decoder(self.encoded_nodes, abs_partial_solu_2, abs_scatter_solu_1_seleted,abs_scatter_solu_1_unseleted, rtdl_features=rtdl_features)
 
             # 根据 abs_scatter_solu_1_seleted 这个点，和 abs_partial_solu_2， 生成相应的label
 
@@ -49,7 +55,7 @@ class TSPModel(nn.Module):
             # drawPic_v1(data[1], abs_solution[1], unselect_list[1], abs_scatter_solu_1_unseleted[1],abs_scatter_solu_1_seleted[1],
             #            partial_end_node_coor[1,0,:],name=str(current_step))
 
-            prob = probs[torch.arange(batch_size_V)[:, None], rela_label].reshape(batch_size_V,1)  # shape: [B, 1]
+            prob = probs[torch.arange(batch_size_V, device=data.device)[:, None], rela_label].reshape(batch_size_V,1)  # shape: [B, 1]
 
             return prob, unselect_list,abs_scatter_solu_1_unseleted, abs_scatter_solu_1_seleted
 
@@ -59,7 +65,7 @@ class TSPModel(nn.Module):
 
             abs_scatter_solu_1_seleted = abs_scatter_solu_1[self.index_gobal, random_index]
 
-            index1 = torch.arange(abs_scatter_solu_1.shape[1])[None, :].repeat(batch_size_V, 1)
+            index1 = torch.arange(abs_scatter_solu_1.shape[1], device=data.device)[None, :].repeat(batch_size_V, 1)
 
             tmp1 = (index1 < random_index).long()
 
@@ -74,8 +80,11 @@ class TSPModel(nn.Module):
             if current_step<=1 and not knearest:
                 self.encoded_nodes = self.encoder(data)
 
+            # Use provided rtdl_features or compute if not provided
+            if self.with_RTDL and rtdl_features is None:
+                rtdl_features = self.compute_rtdl_features(data, abs_partial_solu_2)
             probs = self.decoder(self.encoder, self.encoded_nodes, data,
-                                 abs_partial_solu_2, abs_scatter_solu_1_seleted,abs_scatter_solu_1_unseleted)
+                                 abs_partial_solu_2, abs_scatter_solu_1_seleted,abs_scatter_solu_1_unseleted, rtdl_features=rtdl_features)
 
             rela_selected = probs.argmax(dim=1).unsqueeze(1)  # shape: B
 
@@ -91,7 +100,8 @@ class TSPModel(nn.Module):
     def generate_label(self, random_index, abs_solution, abs_scatter_solu_1, abs_partial_solu_2,
                        abs_scatter_solu_1_seleted, batch_size_V, problem_size):
 
-        index1 = torch.arange(abs_scatter_solu_1.shape[1])[None,:].repeat(batch_size_V,1)
+        device = abs_scatter_solu_1.device
+        index1 = torch.arange(abs_scatter_solu_1.shape[1], device=device)[None,:].repeat(batch_size_V,1)
 
 
         tmp1 = (index1 < random_index).long()
@@ -110,7 +120,7 @@ class TSPModel(nn.Module):
 
         tmp3 = tmp1 == tmp2
 
-        index_1 = torch.arange(problem_size, dtype=torch.long)[None, :].repeat(batch_size_V, 1).unsqueeze(1).\
+        index_1 = torch.arange(problem_size, dtype=torch.long, device=device)[None, :].repeat(batch_size_V, 1).unsqueeze(1).\
                    repeat(1, num_scatter_unseleted, 1)
 
         index_2 = index_1[tmp3].reshape(batch_size_V, num_scatter_unseleted)
@@ -119,7 +129,7 @@ class TSPModel(nn.Module):
 
         new_list_len = problem_size - num_scatter_unseleted  # shape: [B, V-current_step]
 
-        index_3 = torch.arange(batch_size_V, dtype=torch.long)[:, None].expand(batch_size_V, index_2.shape[1])
+        index_3 = torch.arange(batch_size_V, dtype=torch.long, device=device)[:, None].expand(batch_size_V, index_2.shape[1])
 
         new_list[index_3, index_2] = -2
 
@@ -128,19 +138,19 @@ class TSPModel(nn.Module):
         # ---------------------------
 
         tmp4 = abs_scatter_solu_1_seleted == unselect_list
-        index_1 = torch.arange(unselect_list.shape[1], dtype=torch.long)[None, :].repeat(batch_size_V, 1)
+        index_1 = torch.arange(unselect_list.shape[1], dtype=torch.long, device=device)[None, :].repeat(batch_size_V, 1)
 
         index_2 = index_1[tmp4].reshape(batch_size_V, 1)
         index_3 = index_2 - 1
 
-        index4 = torch.arange(batch_size_V)[:,None]
+        index4 = torch.arange(batch_size_V, device=device)[:,None]
         abs_teacher_index = unselect_list[index4,index_3]
         # print(abs_teacher_index)
 
         # -----------------
 
         tmp5 = abs_teacher_index == abs_partial_solu_2
-        index_1 = torch.arange(abs_partial_solu_2.shape[1], dtype=torch.long)[None, :].repeat(batch_size_V, 1)
+        index_1 = torch.arange(abs_partial_solu_2.shape[1], dtype=torch.long, device=device)[None, :].repeat(batch_size_V, 1)
 
         index_2 = index_1[tmp5].reshape(batch_size_V, 1)
         rela_label = index_2
@@ -160,11 +170,12 @@ class TSPModel(nn.Module):
 
 
         num_abs_partial_solu_2 = abs_partial_solu_2.shape[1]
+        device = abs_partial_solu_2.device
 
-        temp_extend_solution = -torch.ones(num_abs_partial_solu_2 + 1)[None,:].repeat(batch_size_V,1)
+        temp_extend_solution = -torch.ones(num_abs_partial_solu_2 + 1, device=device)[None,:].repeat(batch_size_V,1)
         temp_extend_solution = temp_extend_solution.long()
 
-        index1 = torch.arange(num_abs_partial_solu_2+1)[None,:].repeat(batch_size_V,1)
+        index1 = torch.arange(num_abs_partial_solu_2+1, device=device)[None,:].repeat(batch_size_V,1)
 
         tmp1 = (index1 <= rela_selected).long()
 
@@ -176,10 +187,96 @@ class TSPModel(nn.Module):
 
 
         # 这一步是要把被insert的点放在 temp_extend_solution 的 rela_selected+1 这个index
-        index3 = torch.arange(batch_size_V)[:,None]
+        index3 = torch.arange(batch_size_V, device=device)[:,None]
         temp_extend_solution[index3,rela_selected+1] = abs_scatter_solu_1_seleted
 
         return temp_extend_solution
+
+    def compute_rtdl_features(self, data, abs_partial_solu_2):
+        """
+        Compute RTDL(current_solution, Full_Graph) for current partial solution.
+        Returns dictionary of edge weights that can be cached.
+        
+        Args:
+            data: coordinates [B, V, 2]
+            abs_partial_solu_2: partial solution node indices [B, num_partial_nodes]
+            
+        Returns:
+            rtdl_cache: List of dicts, one per batch item. Each dict: {(u, v): weight}
+        """
+        batch_size = data.shape[0]
+        problem_size = data.shape[1]
+        
+        rtdl_cache_list = []
+        
+        for b in range(batch_size):
+            coords = data[b]  # [V, 2]
+            partial_solution = abs_partial_solu_2[b]  # [num_partial_nodes]
+            
+            # Compute full graph distance matrix
+            edge_len = torch.cdist(coords, coords, p=2)  # [V, V]
+            
+            # Create partial solution distance matrix (only edges in partial solution)
+            partial_edge_len = torch.full((problem_size, problem_size), float('inf'), device=data.device)
+            partial_edge_len.fill_diagonal_(0.0)
+            
+            # Add edges from partial solution
+            num_partial_nodes = abs_partial_solu_2.shape[1]
+            for i in range(num_partial_nodes):
+                u = partial_solution[i].item()
+                v = partial_solution[(i + 1) % num_partial_nodes].item()
+                partial_edge_len[u, v] = edge_len[u, v]
+                partial_edge_len[v, u] = edge_len[v, u]
+            
+            # Compute RTDL(current_solution, Full_Graph)
+            rtdl = RTD_Lite(edge_len, partial_edge_len)
+            _, _, rtdl_output = rtdl()  # [V, V]
+            
+            # Store weights for edges in current partial solution
+            rtdl_cache = {}
+            for i in range(num_partial_nodes):
+                u = partial_solution[i].item()
+                v = partial_solution[(i + 1) % num_partial_nodes].item()
+                weight = rtdl_output[u, v].item()
+                rtdl_cache[(u, v)] = weight
+            
+            rtdl_cache_list.append(rtdl_cache)
+        
+        return rtdl_cache_list  # List of dicts: [{(u, v): weight}, ...]
+    
+    def extract_rtdl_weights_for_edges(self, rtdl_cache_list, abs_partial_solu_2):
+        """
+        Extract RTDL weights for edges in current partial solution from cached dictionary.
+        If edge is not in cache, use 0.
+        
+        Args:
+            rtdl_cache_list: List of dicts with cached RTDL weights [{(u, v): weight}, ...]
+            abs_partial_solu_2: partial solution node indices [B, num_partial_nodes]
+            
+        Returns:
+            rtdl_weights: RTDL weights for edges in partial solution [B, num_partial_nodes]
+        """
+        batch_size = len(rtdl_cache_list)
+        num_partial_nodes = abs_partial_solu_2.shape[1]
+        device = abs_partial_solu_2.device
+        
+        rtdl_weights_list = []
+        
+        for b in range(batch_size):
+            partial_solution = abs_partial_solu_2[b]  # [num_partial_nodes]
+            rtdl_cache = rtdl_cache_list[b]  # {(u, v): weight}
+            
+            # Extract RTDL weights for edges in current partial solution
+            edge_weights = torch.zeros(num_partial_nodes, device=device)
+            for i in range(num_partial_nodes):
+                u = partial_solution[i].item()
+                v = partial_solution[(i + 1) % num_partial_nodes].item()
+                # Use cached weight if available, otherwise 0
+                edge_weights[i] = rtdl_cache.get((u, v), 0.0)
+            
+            rtdl_weights_list.append(edge_weights)
+        
+        return torch.stack(rtdl_weights_list)  # [B, num_partial_nodes]
 
 
 ########################################
@@ -210,7 +307,8 @@ class TSP_Decoder(nn.Module):
         encoder_layer_num = self.model_params['decoder_layer_num']
 
         self.embedding_last_node = nn.Linear(embedding_dim, embedding_dim, bias=True)
-        self.embedding_partial_node = nn.Linear(embedding_dim*2, embedding_dim, bias=True)
+        # embedding_dim*2 + 1 to include RTDL weight
+        self.embedding_partial_node = nn.Linear(embedding_dim*2 + 1, embedding_dim, bias=True)
         self.embedding_scatter_node = nn.Linear(embedding_dim, embedding_dim, bias=True)
 
         self.layers = nn.ModuleList([DecoderLayer(**model_params) for _ in range(encoder_layer_num)])
@@ -228,7 +326,7 @@ class TSP_Decoder(nn.Module):
 
         return picked_nodes
 
-    def forward(self, encoder, encoded_nodes, data, abs_partial_solu_2, abs_scatter_solu_1_seleted,abs_scatter_solu_1_unseleted):
+    def forward(self, encoder, encoded_nodes, data, abs_partial_solu_2, abs_scatter_solu_1_seleted,abs_scatter_solu_1_unseleted, rtdl_features=None):
 
 
         knearest = self.model_params['knearest']
@@ -295,6 +393,25 @@ class TSP_Decoder(nn.Module):
 
             left_encoded_node = torch.cat((enc_partial_nodes1,enc_partial_nodes2), dim=2)
 
+            # Add RTDL weights if available
+            if rtdl_features is not None:
+                # rtdl_features: [B, num_partial_nodes]
+                # We need to add RTDL weight for each edge (between consecutive nodes)
+                # Note: when knearest is used, we might have fewer edges
+                if left_encoded_node.shape[1] == rtdl_features.shape[1]:
+                    rtdl_weights = rtdl_features.unsqueeze(-1)  # [B, num_partial_nodes, 1]
+                    left_encoded_node = torch.cat((left_encoded_node, rtdl_weights), dim=2)
+                else:
+                    # If dimensions don't match (knearest case), use zeros
+                    batch_size, num_edges, _ = left_encoded_node.shape
+                    zeros = torch.zeros(batch_size, num_edges, 1, device=left_encoded_node.device)
+                    left_encoded_node = torch.cat((left_encoded_node, zeros), dim=2)
+            else:
+                # If RTDL is not used, add zeros
+                batch_size, num_edges, _ = left_encoded_node.shape
+                zeros = torch.zeros(batch_size, num_edges, 1, device=left_encoded_node.device)
+                left_encoded_node = torch.cat((left_encoded_node, zeros), dim=2)
+
             left_encoded_node = self.embedding_partial_node(left_encoded_node)
 
             out = torch.cat((embedded_last_node_, enc_unseleted_scatter_node, left_encoded_node), dim=1)
@@ -341,6 +458,17 @@ class TSP_Decoder(nn.Module):
             left_encoded_node = enc_partial_nodes
 
             left_encoded_node = torch.cat((left_encoded_node, torch.roll(left_encoded_node, dims=1, shifts=-1)), dim=2)
+
+            # Add RTDL weights if available
+            if rtdl_features is not None:
+                # rtdl_features: [B, num_partial_nodes]
+                rtdl_weights = rtdl_features.unsqueeze(-1)  # [B, num_partial_nodes, 1]
+                left_encoded_node = torch.cat((left_encoded_node, rtdl_weights), dim=2)
+            else:
+                # If RTDL is not used, add zeros
+                batch_size, num_edges, _ = left_encoded_node.shape
+                zeros = torch.zeros(batch_size, num_edges, 1, device=left_encoded_node.device)
+                left_encoded_node = torch.cat((left_encoded_node, zeros), dim=2)
 
             left_encoded_node = self.embedding_partial_node(left_encoded_node)
 

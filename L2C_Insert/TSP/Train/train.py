@@ -57,7 +57,10 @@ model_params = {
     'knearest': False,
     'k_nearest_edges': 100,
     'k_nearest_scatter': 100,
-    'coor_norm': False
+    'coor_norm': False,
+    'with_RTDL': True,  # Enable RTDL features
+    'update_RTD': 5,  # Steps between RTDL updates (default: every step)
+    'debug_mode': DEBUG_MODE  # Enable debug logging for RTDL
 }
 
 optimizer_params = {
@@ -73,6 +76,7 @@ optimizer_params = {
 trainer_params = {
     'use_cuda': USE_CUDA,
     'cuda_device_num': CUDA_DEVICE_NUM,
+    'debug_mode': DEBUG_MODE,
     'epochs': 15,
     'train_episodes': 1000000,
     'train_batch_size': 1024,

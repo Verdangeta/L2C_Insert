@@ -69,7 +69,9 @@ class TSPTrainer:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.scheduler.last_epoch = model_load['epoch'] - 1
             self.logger.info('Saved Model Loaded !!')
-        self.optimizer.param_groups[0]['capturable'] = True
+        # capturable=True only works with CUDA tensors
+        if USE_CUDA:
+            self.optimizer.param_groups[0]['capturable'] = True
         # utility
         self.time_estimator = TimeEstimator()
 
@@ -184,14 +186,21 @@ class TSPTrainer:
 
         reset_state, _, _ = self.env.reset(self.env_params['mode'])
 
-        prob_list = torch.ones(size=(batch_size, 0))
-
         state, reward, reward_student, done = self.env.pre_step()
+        
+        # Get device from state.data or model
+        device = state.data.device if hasattr(state, 'data') and state.data is not None else next(self.model.parameters()).device
+        prob_list = torch.ones(size=(batch_size, 0), device=device)
 
         current_step = 0
 
         last_node_index = self.env.abs_partial_solu_2[:, [-1]]
         self.model.mode = 'train'
+        
+        # RTDL caching: store features for the current batch
+        rtdl_features_cache = None
+        update_RTD = self.model_params.get('update_RTD', 1)
+        
         while not done:
             partial_end_node_coor = self.model.decoder._get_encoding(state.data, last_node_index)
 
@@ -209,13 +218,56 @@ class TSPTrainer:
             # print(f'************************ current step {current_step} ************************')
             # print('******************************************************************************')
 
+            # Update RTDL features cache if needed
+            if self.model.with_RTDL:
+                # Check if we need to recompute RTDL(current_solution, Full_Graph)
+                # Update only when: (1) step is multiple of update_RTD, or (2) cache is None
+                should_update = (
+                    (current_step % update_RTD == 0) or 
+                    (rtdl_features_cache is None)
+                )
+                
+                if should_update:
+                    # Compute RTDL(current_solution, Full_Graph) for current partial solution
+                    # Returns list of dicts: [{(u, v): weight}, ...] for each batch item
+                    rtdl_features_cache = self.model.compute_rtdl_features(
+                        state.data, self.env.abs_partial_solu_2)
+                    
+                    # Debug logging for RTDL cache update
+                    if self.trainer_params.get('debug_mode', False):
+                        if current_step == 0 or (current_step % update_RTD == 0):
+                            num_cached_edges = len(rtdl_features_cache[0]) if rtdl_features_cache else 0
+                            self.logger.info(f"[RTDL Debug] Step {current_step}: RTDL cache updated, "
+                                           f"cached {num_cached_edges} edges for batch[0]")
+                
+                # Extract RTDL weights for current partial solution edges from cache
+                # Uses cached weights if available, otherwise 0
+                rtdl_weights = self.model.extract_rtdl_weights_for_edges(
+                    rtdl_features_cache, self.env.abs_partial_solu_2)
+                
+                # Debug logging for extracted weights
+                if self.trainer_params.get('debug_mode', False) and (current_step < 5 or current_step % update_RTD == 0):
+                    batch_idx = 0
+                    num_edges = rtdl_weights.shape[1]
+                    if num_edges > 0:
+                        rtdl_sample = rtdl_weights[batch_idx].detach().cpu().numpy()
+                        self.logger.info(f"[RTDL Debug] Step {current_step}, Batch[0] extracted weights: "
+                                       f"min={rtdl_sample.min():.6f}, max={rtdl_sample.max():.6f}, "
+                                       f"mean={rtdl_sample.mean():.6f}, std={rtdl_sample.std():.6f}")
+                        num_to_show = min(5, num_edges)
+                        edge_weights_str = ', '.join([f"{w:.6f}" for w in rtdl_sample[:num_to_show]])
+                        self.logger.info(f"[RTDL Debug] Step {current_step}, Batch[0] first {num_to_show} edge weights: [{edge_weights_str}]")
+            else:
+                rtdl_weights = None
+
             prob, unselect_list, abs_scatter_solu_1_unseleted, abs_scatter_solu_1_seleted = self.model(state.data,
                                                                                                        self.env.solution,
                                                                                                        self.env.abs_scatter_solu_1,
                                                                                                        self.env.abs_partial_solu_2,
                                                                                                        random_index,
                                                                                                        current_step,
-                                                                                                       last_node_index)
+                                                                                                       last_node_index,
+                                                                                                       rtdl_features=rtdl_weights)
 
             last_node_index = abs_scatter_solu_1_seleted
 
