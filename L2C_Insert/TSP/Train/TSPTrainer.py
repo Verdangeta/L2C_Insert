@@ -197,9 +197,15 @@ class TSPTrainer:
         last_node_index = self.env.abs_partial_solu_2[:, [-1]]
         self.model.mode = 'train'
         
-        # RTDL caching: store features for the current batch
         rtdl_features_cache = None
-        update_RTD = self.model_params.get('update_RTD', 1)
+        update_RTD_percent = self.model_params.get('update_RTD', 5.0)
+        
+        num_nodes = state.data.shape[1]
+        num_total_edges = num_nodes * (num_nodes - 1) // 2
+        update_step = max(1, int(num_total_edges * update_RTD_percent / 100.0))
+        
+        if self.model.with_RTDL and self.trainer_params.get('debug_mode', False):
+            self.logger.info(f"[RTDL Debug] Graph: {num_nodes} nodes, {num_total_edges} edges, update every {update_step} steps ({update_RTD_percent}%)")
         
         while not done:
             partial_end_node_coor = self.model.decoder._get_encoding(state.data, last_node_index)
@@ -221,9 +227,9 @@ class TSPTrainer:
             # Update RTDL features cache if needed
             if self.model.with_RTDL:
                 # Check if we need to recompute RTDL(current_solution, Full_Graph)
-                # Update only when: (1) step is multiple of update_RTD, or (2) cache is None
+                # Update only when: (1) step is multiple of update_step (based on % of edges), or (2) cache is None
                 should_update = (
-                    (current_step % update_RTD == 0) or 
+                    (current_step % update_step == 0) or 
                     (rtdl_features_cache is None)
                 )
                 
@@ -235,7 +241,7 @@ class TSPTrainer:
                     
                     # Debug logging for RTDL cache update
                     if self.trainer_params.get('debug_mode', False):
-                        if current_step == 0 or (current_step % update_RTD == 0):
+                        if current_step == 0 or (current_step % update_step == 0):
                             num_cached_edges = len(rtdl_features_cache[0]) if rtdl_features_cache else 0
                             self.logger.info(f"[RTDL Debug] Step {current_step}: RTDL cache updated, "
                                            f"cached {num_cached_edges} edges for batch[0]")
@@ -246,7 +252,7 @@ class TSPTrainer:
                     rtdl_features_cache, self.env.abs_partial_solu_2)
                 
                 # Debug logging for extracted weights
-                if self.trainer_params.get('debug_mode', False) and (current_step < 5 or current_step % update_RTD == 0):
+                if self.trainer_params.get('debug_mode', False) and (current_step < 5 or current_step % update_step == 0):
                     batch_idx = 0
                     num_edges = rtdl_weights.shape[1]
                     if num_edges > 0:
