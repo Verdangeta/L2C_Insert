@@ -183,6 +183,7 @@ class TSPTester():
 
             # RTDL caching: store features for the current batch
             rtdl_features_cache = None
+            self.model.reset_rtdl_full_graph_cache()
             update_RTD = self.model_params.get('update_RTD', 1)
 
             while not done:

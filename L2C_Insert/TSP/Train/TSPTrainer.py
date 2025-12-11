@@ -198,6 +198,7 @@ class TSPTrainer:
         self.model.mode = 'train'
         
         rtdl_features_cache = None
+        self.model.reset_rtdl_full_graph_cache()
         update_RTD_percent = self.model_params.get('update_RTD', 5.0)
         
         num_nodes = state.data.shape[1]

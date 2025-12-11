@@ -19,6 +19,13 @@ class TSPModel(nn.Module):
         self.decoder = TSP_Decoder(**model_params)
         self.encoded_nodes = None
 
+        # Cache for full-graph distances/MST during one tour construction
+        self._rtdl_full_graph_cache = None
+
+    def reset_rtdl_full_graph_cache(self):
+        """Clear cached full-graph distances/MST (call when starting a new graph/batch)."""
+        self._rtdl_full_graph_cache = None
+
 
 
     def forward(self, data, abs_solution, abs_scatter_solu_1, abs_partial_solu_2, random_index,
@@ -213,8 +220,22 @@ class TSPModel(nn.Module):
             coords = data[b]  # [V, 2]
             partial_solution = abs_partial_solu_2[b]  # [num_partial_nodes]
             
-            # Compute full graph distance matrix
-            edge_len = torch.cdist(coords, coords, p=2)  # [V, V]
+            # Lazily compute and cache full-graph distance matrix and MST for this batch
+            cache_key = data.data_ptr()  # assumes data tensor is stable within one tour
+            cache = self._rtdl_full_graph_cache
+            if cache is None or cache.get('key') != cache_key:
+                cache = {'key': cache_key, 'edge_len': [], 'r1_mst': []}
+                for bb in range(batch_size):
+                    full_edge = torch.cdist(data[bb], data[bb], p=2)  # [V, V]
+                    _, mst_edges, mst_w = prim_algo(full_edge.cpu())
+                    order_np = mst_w.argsort().cpu().numpy()
+                    sorted_edges = mst_edges[order_np]
+                    sorted_weights = mst_w[order_np]
+                    cache['edge_len'].append(full_edge)
+                    cache['r1_mst'].append((sorted_edges, sorted_weights))
+                self._rtdl_full_graph_cache = cache
+
+            edge_len = cache['edge_len'][b]
             
             # Create partial solution distance matrix (only edges in partial solution)
             partial_edge_len = torch.full((problem_size, problem_size), float('inf'), device=data.device)
@@ -228,9 +249,10 @@ class TSPModel(nn.Module):
                 partial_edge_len[u, v] = edge_len[u, v]
                 partial_edge_len[v, u] = edge_len[v, u]
             
-            # Compute RTDL(current_solution, Full_Graph)
+            # Compute RTDL(current_solution, Full_Graph) using cached full-graph MST
             rtdl = RTD_Lite(edge_len, partial_edge_len)
-            _, _, rtdl_output = rtdl()  # [V, V]
+            r1_mst = cache['r1_mst'][b]
+            _, _, rtdl_output = rtdl(r1_mst=r1_mst)  # [V, V]
             
             # Store weights for edges in current partial solution
             rtdl_cache = {}
