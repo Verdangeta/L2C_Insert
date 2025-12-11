@@ -30,17 +30,17 @@ class DSU:
 
 def prim_algo(adjacency_matrix):
     n = len(adjacency_matrix)
-    
+
     infty = torch.max(adjacency_matrix).item() + 10
     dst = torch.ones(n, device=adjacency_matrix.device) * infty
     ancestors = -torch.ones(n, dtype=int, device=adjacency_matrix.device)
     visited = torch.zeros(n, dtype=bool, device=adjacency_matrix.device)
-    
+
     mst_edges = np.zeros((n - 1, 2), dtype=np.int32)
-    s, v = torch.tensor(0.0, device=adjacency_matrix.device), 0
+    s, v = adjacency_matrix.new_zeros(()), 0
     for i in range(n - 1):
         visited[v] = 1
-        
+
         ancestors[dst > adjacency_matrix[v]] = v
         dst = torch.minimum(dst, adjacency_matrix[v])
         dst[visited] = infty
@@ -79,7 +79,7 @@ class RTD_Lite:
             self.max_TSP_len = 0.0
 
         
-    def __call__(self, r1_mst=None):
+    def __call__(self, r1_mst=None, edges_only=None, return_matrix=True):
         # Compute rmin as the element-wise minimum of the full and partial solution graphs
         rmin = torch.minimum(self.r1, self.r2)
 
@@ -101,12 +101,13 @@ class RTD_Lite:
         # and the smallest edge in the full graph that is larger than biggest_MST_edge_w
         if len(r1_edge_w) > 0:
             biggest_MST_edge_w = torch.max(r1_edge_w)
-            valid_edges = self.r1[self.r1 > biggest_MST_edge_w]
-            if len(valid_edges) > 0:
-                birth_biggest_TSP_edge = torch.min(valid_edges)
-            else:
+            valid_edges = self.r1.masked_fill(self.r1 <= biggest_MST_edge_w, float('inf'))
+            birth_biggest_TSP_edge = torch.min(valid_edges)
+            if torch.isinf(birth_biggest_TSP_edge):
                 # No larger edge exists; fallback to the largest MST edge
                 birth_biggest_TSP_edge = biggest_MST_edge_w
+            else:
+                birth_biggest_TSP_edge = birth_biggest_TSP_edge
         else:
             biggest_MST_edge_w = 0.0
             birth_biggest_TSP_edge = 0.0
@@ -118,36 +119,61 @@ class RTD_Lite:
         r2_edge_idx = r2_edge_idx[r2_edge_w.argsort()]
         r2_edge_w = r2_edge_w[r2_edge_w.argsort()]
 
+        r2_edge_w_np = r2_edge_w.cpu().numpy() if isinstance(r2_edge_w, torch.Tensor) else np.array(r2_edge_w)
+
         # Initialize Disjoint Set Union (DSU) structure for the full graph
         min_graph_dsu = DSU(self.r1.shape[0])
-        barcodes = {'1->2' : [], '2->1' : []}  # Persistence barcode storage for edges
+        # Preallocate barcodes; +1 slot for potential max edge
+        barcodes_21 = torch.zeros((len(rmin_edge_idx) + 1, 2), device=self.device)
+        barcode_count = 0
+        barcodes = {'1->2' : [], '2->1' : barcodes_21}  # Persistence barcode storage for edges
 
         # Store the edge pairs corresponding to birth/death times
         path_edges_from_barcodes = np.zeros((len(rmin_edge_idx), 2), dtype=np.int32)
         for i in range(len(rmin_edge_idx)):
-            # Find the two components (cliques) connected by this edge in the current DSU
-            u_clique = min_graph_dsu.find(rmin_edge_idx[i][0])
-            v_clique = min_graph_dsu.find(rmin_edge_idx[i][1])
+            # Use the actual endpoints (not DSU roots) for path query in r2 MST
+            u_clique = rmin_edge_idx[i][0]
+            v_clique = rmin_edge_idx[i][1]
             birth = rmin_edge_w[i]
 
-            # Create a copy of the current DSU to simulate unions in the partial graph
-            r2_graph_dsu = deepcopy(min_graph_dsu)
-            death_2 = birth  # Default: death at birth (no separation)
-            for j in range(len(r2_edge_idx)):
-                # Unite edges in the r2 (partial) MST
-                r2_graph_dsu.unite(r2_edge_idx[j][0], r2_edge_idx[j][1])
+            # Legacy-equivalent search using lightweight DSU copy (numpy arrays)
+            parent = min_graph_dsu.parent.copy()
+            rank = min_graph_dsu.rank.copy()
 
-                # If the cliques merge, record the death time and edge, then break
-                if r2_graph_dsu.find(u_clique) == r2_graph_dsu.find(v_clique):
-                    death_2 = r2_edge_w[j]
+            def find_local(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def unite_local(a, b):
+                ra, rb = find_local(a), find_local(b)
+                if ra == rb:
+                    return
+                if rank[ra] < rank[rb]:
+                    ra, rb = rb, ra
+                if rank[ra] == rank[rb]:
+                    rank[ra] += 1
+                parent[rb] = ra
+
+            # Include previously added rmin edges (current min_graph_dsu state)
+            # already encoded in parent/rank copies
+            death_2 = birth
+            for j, (u2, v2) in enumerate(r2_edge_idx):
+                unite_local(u2, v2)
+                if find_local(u_clique) == find_local(v_clique):
+                    death_2 = r2_edge_w_np[j]
                     path_edges_from_barcodes[i] = r2_edge_idx[j]
                     break
+            else:
+                path_edges_from_barcodes[i] = r2_edge_idx[0]
 
             # Only record barcodes if the death time is after the birth time (i.e., persistence interval exists)
             if death_2 > birth:
-                barcodes['2->1'].append(torch.stack((birth, death_2)).to(self.device))
+                barcodes_21[barcode_count] = torch.stack((birth, torch.tensor(death_2, device=self.device)))
             else:
-                barcodes['2->1'].append(torch.tensor((0, 0), device=self.device))
+                barcodes_21[barcode_count] = torch.tensor((0, 0), device=self.device)
+            barcode_count += 1
             # Add this edge to the DSU for future iterations (simulate "growing" the MST)
             min_graph_dsu.unite(rmin_edge_idx[i][0], rmin_edge_idx[i][1])
 
@@ -156,38 +182,38 @@ class RTD_Lite:
         max_edge_weight = 0.0
         if self.max_TSP_row_col is not None:
             max_edge_weight = max(self.max_TSP_len - birth_biggest_TSP_edge, 0)
-            # Add corresponding barcode entry for max edge (before stacking)
-            if max_edge_weight > 0:
-                barcodes['2->1'].append(torch.tensor((birth_biggest_TSP_edge, self.max_TSP_len), device=self.device))
-            else:
-                barcodes['2->1'].append(torch.tensor((0, 0), device=self.device))
-            # Also add max edge to path_edges for logging (append to the end)
-            max_edge_array = np.array([[self.max_TSP_row_col[0], self.max_TSP_row_col[1]]], dtype=np.int32)
-            path_edges_from_barcodes = np.vstack([path_edges_from_barcodes, max_edge_array])
+            # Add corresponding barcode entry for max edge
+            barcodes_21[barcode_count] = torch.tensor((birth_biggest_TSP_edge, self.max_TSP_len), device=self.device) if max_edge_weight > 0 else torch.tensor((0, 0), device=self.device)
+            barcode_count += 1
 
-        # Stack barcodes into tensors if not empty
-        if len(barcodes['1->2']) > 0:
-            barcodes['1->2'] = torch.stack(barcodes['1->2']).to(self.device)
-        if len(barcodes['2->1']) > 0:
-            barcodes['2->1'] = torch.stack(barcodes['2->1']).to(self.device)
+        # Trim unused barcode slots
+        barcodes['2->1'] = barcodes_21[:barcode_count]
 
-        # Initialize output tensor for RTDL edge-based weights
-        output = torch.zeros_like(self.r1).to(self.device)
-        # Populate output for each barcode (edge) found
-        for index, (i, j) in enumerate(path_edges_from_barcodes):
-            if index < len(barcodes['2->1']):
-                # The RTDL weight for edge (i,j) is its persistence (death-birth)
-                output[i, j] = barcodes['2->1'][index][1] - barcodes['2->1'][index][0]
-                output[j, i] = barcodes['2->1'][index][1] - barcodes['2->1'][index][0]
-
-        # Set max edge weight in output (already computed above)
+        # Build sparse edge weights mapping
+        edge_weights_dict = {}
+        for index, (i, j) in enumerate(path_edges_from_barcodes[:barcode_count]):
+            weight = barcodes['2->1'][index][1] - barcodes['2->1'][index][0]
+            edge_weights_dict[(int(i), int(j))] = weight
+            edge_weights_dict[(int(j), int(i))] = weight
         if self.max_TSP_row_col is not None:
-            output[self.max_TSP_row_col[0], self.max_TSP_row_col[1]] = max_edge_weight
-            output[self.max_TSP_row_col[1], self.max_TSP_row_col[0]] = max_edge_weight
+            edge_weights_dict[(int(self.max_TSP_row_col[0]), int(self.max_TSP_row_col[1]))] = max_edge_weight
+            edge_weights_dict[(int(self.max_TSP_row_col[1]), int(self.max_TSP_row_col[0]))] = max_edge_weight
 
-        # Return: 
-        #   barcodes: dictionary of persistence intervals
-        #   path_edges_from_barcodes: edge (i,j) for each birth-death, plus max edge at the end
-        #   output: edgewise RTDL differences matrix
-        return barcodes, path_edges_from_barcodes, output
+        if return_matrix:
+            # Initialize output tensor for RTDL edge-based weights
+            output = torch.zeros_like(self.r1).to(self.device)
+            # Populate output for each barcode (edge) found
+            for (i, j), w in edge_weights_dict.items():
+                output[i, j] = w
+            # Return: barcodes, path edges, dense output
+            return barcodes, path_edges_from_barcodes[:barcode_count], output
+        else:
+            # If edges_only provided, filter; else return full dict
+            if edges_only is not None:
+                filtered = {}
+                for (u, v) in edges_only:
+                    filtered[(u, v)] = edge_weights_dict.get((u, v), torch.tensor(0.0, device=self.device))
+                edge_weights_dict = filtered
+            return barcodes, path_edges_from_barcodes[:barcode_count], edge_weights_dict
+        # Return kept above
 

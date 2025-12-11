@@ -59,7 +59,7 @@ model_params = {
     'k_nearest_scatter': 100,
     'coor_norm': False,
     'with_RTDL': True,  # Enable RTDL features
-    'update_RTD': 5,  # Steps between RTDL updates (default: every step)
+    'update_RTD': 10,  # Steps between RTDL updates (default: every step)
     'debug_mode': DEBUG_MODE  # Enable debug logging for RTDL
 }
 

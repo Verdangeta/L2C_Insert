@@ -264,28 +264,28 @@ class TSPModel(nn.Module):
                 partial_edge_len[v, u] = edge_len[v, u]
             
             # Compute RTDL(current_solution, Full_Graph) using cached full-graph MST
+            # Prepare edges of partial solution to query RTDL directly without dense matrix
+            tour_edges = [(partial_solution[i].item(), partial_solution[(i + 1) % num_partial_nodes].item())
+                          for i in range(num_partial_nodes)]
+
             rtdl = RTD_Lite(edge_len, partial_edge_len)
             r1_mst = cache['r1_mst'][b]
-            barcodes, path_edges_from_barcodes, rtdl_output = rtdl(r1_mst=r1_mst)  # [V, V]
+            _, _, edge_weights_dict = rtdl(r1_mst=r1_mst, edges_only=tour_edges, return_matrix=False)
             
             # Store weights for edges in current partial solution
-            # Order: rtdl_cache stores (u, v) where u = partial_solution[i], v = partial_solution[(i+1) % num_partial_nodes]
             rtdl_cache = {}
             edge_order_list = []  # Store order for debugging
-            for i in range(num_partial_nodes):
-                u = partial_solution[i].item()
-                v = partial_solution[(i + 1) % num_partial_nodes].item()
-                # Check both directions since RTDL may store in either direction
-                weight_uv = rtdl_output[u, v].item()
-                weight_vu = rtdl_output[v, u].item()
-                weight = max(weight_uv, weight_vu)  # Take max of both directions
+            zero = torch.tensor(0.0, device=data.device)
+            for i, (u, v) in enumerate(tour_edges):
+                w = edge_weights_dict.get((u, v), zero)
+                # handle plain float/int fallback
+                weight = float(w) if isinstance(w, (float, int)) else w.item()
                 rtdl_cache[(u, v)] = weight
                 edge_order_list.append((i, u, v, weight))
             
             # Debug: Check how many tour edges are in full graph MST
             if b == 0 and self.model_params.get('debug_mode', False):
                 from logging import getLogger
-                from L2C_Insert.TSP.utils.RTD_Lite_TSP import prim_algo
                 logger = getLogger(name='trainer')
                 
                 # Compute MST for full graph
@@ -313,41 +313,36 @@ class TSPModel(nn.Module):
                 logger.info(f"[RTDL Debug] Tour edges in full graph MST: {tour_edges_in_mst}/{num_partial_nodes}")
                 logger.info(f"[RTDL Debug] Tour edges NOT in full graph MST: {len(tour_edges_not_in_mst)}/{num_partial_nodes}")
                 if tour_edges_not_in_mst:
+                    # sort by descending RTDL weight
+                    tour_edges_not_in_mst.sort(key=lambda x: x[3], reverse=True)
                     logger.info(f"[RTDL Debug] Edges NOT in MST (should have non-zero RTDL weights):")
                     for i, u, v, w in tour_edges_not_in_mst[:5]:
                         logger.info(f"  Edge[{i}]: ({u}, {v}) -> RTDL weight = {w:.6f}")
                 if tour_edges_in_mst > 0:
-                    logger.info(f"[RTDL Debug] Edges IN MST (should have zero RTDL weights):")
+                    logger.info(f"[RTDL Debug] Edges IN MST (RTDL expected ~0):")
+                    mst_edges_info = []
                     for i in range(num_partial_nodes):
                         u = partial_solution[i].item()
                         v = partial_solution[(i + 1) % num_partial_nodes].item()
                         if (u, v) in full_mst_edges_set or (v, u) in full_mst_edges_set:
                             weight = rtdl_cache.get((u, v), 0.0)
-                            logger.info(f"  Edge[{i}]: ({u}, {v}) -> RTDL weight = {weight:.6f}")
+                            mst_edges_info.append((i, u, v, weight))
+                    mst_edges_info.sort(key=lambda x: x[3])
+                    for i, u, v, weight in mst_edges_info[:5]:
+                        logger.info(f"  cycle_edge[{i}] (in MST): ({u}->{v}), RTDL={weight:.6f}")
+                    if len(mst_edges_info) > 5:
+                        logger.info(f"  ... {len(mst_edges_info)-5} more MST edges")
+
+                # One-line summary of RTDL weights distribution for this tour
+                all_weights = list(rtdl_cache.values())
+                w_min = min(all_weights) if all_weights else 0.0
+                w_max = max(all_weights) if all_weights else 0.0
+                w_mean = sum(all_weights) / len(all_weights) if all_weights else 0.0
+                logger.info(f"[RTDL Debug] Tour RTDL stats: min={w_min:.6f}, max={w_max:.6f}, mean={w_mean:.6f}, edges={len(all_weights)}")
             
-            # Debug logging for first batch item - show only edges with non-zero weights
-            if b == 0 and self.model_params.get('debug_mode', False):
-                from logging import getLogger
-                logger = getLogger(name='trainer')
-                weights_list = list(rtdl_cache.values())
-                if weights_list:
-                    logger.info(f"[RTDL Debug] Batch[0] computed {len(rtdl_cache)} edge weights: "
-                               f"min={min(weights_list):.6f}, max={max(weights_list):.6f}, "
-                               f"mean={sum(weights_list)/len(weights_list):.6f}")
-                    
-                    # Filter edges with non-zero weights
-                    non_zero_edges = [(i, u, v, w) for i, u, v, w in edge_order_list if abs(w) > 1e-8]
-                    
-                    # Log edges in order to verify correct ordering
-                    logger.info(f"[RTDL Debug] Batch[0] edges in order (matching extract_rtdl_weights_for_edges):")
-                    if non_zero_edges:
-                        logger.info(f"  Found {len(non_zero_edges)} edges with non-zero RTDL weights (showing first {min(5, len(non_zero_edges))}):")
-                        for i, u, v, w in non_zero_edges[:5]:
-                            logger.info(f"  Edge[{i}]: ({u}, {v}) -> weight={w:.6f}")
-                        if len(non_zero_edges) > 5:
-                            logger.info(f"  ... (showing first 5 of {len(non_zero_edges)} non-zero edges)")
-                    else:
-                        logger.info(f"  No edges with non-zero RTDL weights found (all weights are 0.0)")
+            # Debug logging only when RTDL recomputed (handled at call site)
+            if False:
+                pass
             
             rtdl_cache_list.append(rtdl_cache)
         
@@ -387,31 +382,6 @@ class TSPModel(nn.Module):
                 # Use cached weight if available, otherwise 0
                 # Cache already has max of both directions from compute_rtdl_features
                 edge_weights[i] = rtdl_cache.get((u, v), 0.0)
-            
-            # Debug logging: verify edge order matches - show only edges with non-zero RTDL weights
-            if b == 0 and self.model_params.get('debug_mode', False):
-                from logging import getLogger
-                logger = getLogger(name='trainer')
-                
-                # Collect edges with non-zero weights
-                non_zero_edges = []
-                for i in range(num_partial_nodes):
-                    u = partial_solution[i].item()
-                    v = partial_solution[(i + 1) % num_partial_nodes].item()
-                    weight = edge_weights[i].item()
-                    if abs(weight) > 1e-8:  # Non-zero weight (with small epsilon for floating point)
-                        cached_weight = rtdl_cache.get((u, v), 0.0)
-                        non_zero_edges.append((i, u, v, weight, cached_weight))
-                
-                logger.info(f"[RTDL Debug] Extracting weights for batch[0], {num_partial_nodes} edges:")
-                if non_zero_edges:
-                    logger.info(f"  Found {len(non_zero_edges)} edges with non-zero RTDL weights (showing first {min(5, len(non_zero_edges))}):")
-                    for i, u, v, weight, cached_weight in non_zero_edges[:5]:
-                        logger.info(f"  Edge[{i}]: ({u}, {v}) -> weight={weight:.6f} (cached: {cached_weight:.6f})")
-                    if len(non_zero_edges) > 5:
-                        logger.info(f"  ... (showing first 5 of {len(non_zero_edges)} non-zero edges)")
-                else:
-                    logger.info(f"  No edges with non-zero RTDL weights found (all weights are 0.0)")
             
             rtdl_weights_list.append(edge_weights)
         
@@ -495,50 +465,26 @@ class TSP_Decoder(nn.Module):
             left_encoded_node = torch.cat((left_encoded_node, zeros), dim=2)
             # left_encoded_node shape: [B, num_partial_nodes, embedding_dim*2 + 1]
 
-        # Debug logging for edge embeddings with RTDL weights
-        if self.model_params.get('debug_mode', False) and rtdl_features is not None:
-            from logging import getLogger
-            logger = getLogger(name='trainer')
-            batch_idx = 0
-            edge_idx = 0  # First edge
-            num_edges = left_encoded_node.shape[1]
-            
-            # Get edge embedding before final embedding layer
-            edge_embedding_before = left_encoded_node[batch_idx, edge_idx, :].detach().cpu()
-            embedding_dim = enc_partial_nodes.shape[2]
-            
-            # Extract components
-            node_i_embedding = edge_embedding_before[:embedding_dim]
-            node_i1_embedding = edge_embedding_before[embedding_dim:2*embedding_dim]
-            rtdl_weight = edge_embedding_before[2*embedding_dim].item()
-            
-            logger.info(f"[RTDL Debug] Edge embedding (before embedding_partial_node) for batch[0], edge[0]:")
-            logger.info(f"  Shape: {edge_embedding_before.shape}")
-            logger.info(f"  Node_i embedding (first {min(5, embedding_dim)} dims): {node_i_embedding[:min(5, embedding_dim)].numpy()}")
-            logger.info(f"  Node_{edge_idx+1} embedding (first {min(5, embedding_dim)} dims): {node_i1_embedding[:min(5, embedding_dim)].numpy()}")
-            logger.info(f"  RTDL weight: {rtdl_weight:.6f}")
-            logger.info(f"  Full edge embedding size: {edge_embedding_before.shape[0]} (embedding_dim*2 + 1 = {embedding_dim*2 + 1})")
-            
-            # Also show edge indices for verification
-            if abs_partial_solu_2.shape[1] > edge_idx:
-                node_i_idx = abs_partial_solu_2[batch_idx, edge_idx].item()
-                node_i1_idx = abs_partial_solu_2[batch_idx, (edge_idx + 1) % num_edges].item()
-                logger.info(f"  Edge: ({node_i_idx}, {node_i1_idx})")
-
+        # Preserve pre-projection edge features for debug
+        left_encoded_node_before = left_encoded_node
         left_encoded_node = self.embedding_partial_node(left_encoded_node)
-        
-        # Debug logging for edge embeddings after embedding layer
+
+        # Debug: summarize RTDL feature vs other features in edge embedding (before projection)
         if self.model_params.get('debug_mode', False) and rtdl_features is not None:
             from logging import getLogger
             logger = getLogger(name='trainer')
             batch_idx = 0
             edge_idx = 0  # First edge
-            
-            edge_embedding_after = left_encoded_node[batch_idx, edge_idx, :].detach().cpu()
-            logger.info(f"[RTDL Debug] Edge embedding (after embedding_partial_node) for batch[0], edge[0]:")
-            logger.info(f"  Shape: {edge_embedding_after.shape}")
-            logger.info(f"  First 5 dims: {edge_embedding_after[:5].numpy()}")
-            logger.info(f"  Mean: {edge_embedding_after.mean().item():.6f}, Std: {edge_embedding_after.std().item():.6f}")
+            embedding_dim = enc_partial_nodes.shape[2]
+            edge_embedding_before = left_encoded_node_before[:, :].detach()
+            node_i = edge_embedding_before[:, :, :embedding_dim]
+            node_j = edge_embedding_before[:, :, embedding_dim:2*embedding_dim]
+            rtdl_w = edge_embedding_before[:, :, 2*embedding_dim] if edge_embedding_before.numel() > 2*embedding_dim else torch.tensor(0.0)
+            logger.info(
+                f"[RTDL Debug] Edge[0] features: RTDL mean/max=({rtdl_w.mean().item():.4f}/{rtdl_w.max().item():.4f}) | "
+                f"node_i mean/std=({node_i.mean().item():.4f}/{node_i.std().item():.4f}) | "
+                f"node_j mean/std=({node_j.mean().item():.4f}/{node_j.std().item():.4f})"
+            )
 
         out = torch.cat((embedded_last_node_, enc_unseleted_scatter_node, left_encoded_node), dim=1)
 

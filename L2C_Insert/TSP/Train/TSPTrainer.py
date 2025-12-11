@@ -202,11 +202,11 @@ class TSPTrainer:
         update_RTD_percent = self.model_params.get('update_RTD', 5.0)
         
         num_nodes = state.data.shape[1]
-        num_total_edges = num_nodes * (num_nodes - 1) // 2
-        update_step = max(1, int(num_total_edges * update_RTD_percent / 100.0))
+        # Обновляем RTDL по проценту от числа вершин тура, а не по количеству ребер полного графа
+        update_step = max(1, int(num_nodes * update_RTD_percent / 100.0))
         
         if self.model.with_RTDL and self.trainer_params.get('debug_mode', False):
-            self.logger.info(f"[RTDL Debug] Graph: {num_nodes} nodes, {num_total_edges} edges, update every {update_step} steps ({update_RTD_percent}%)")
+            self.logger.info(f"[RTDL Debug] Graph: {num_nodes} nodes, update every {update_step} steps ({update_RTD_percent}% of nodes)")
         
         while not done:
             partial_end_node_coor = self.model.decoder._get_encoding(state.data, last_node_index)
