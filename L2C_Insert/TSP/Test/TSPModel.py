@@ -5,7 +5,32 @@ import math
 import numpy as np
 import os
 import matplotlib.pyplot as plt
-from L2C_Insert.TSP.utils.RTD_Lite_TSP import RTD_Lite, prim_algo
+from RTDLite import RTD_Lite
+from RTDLite.converter import convert, convert_with_mst
+import numpy as np
+
+# Import prim_algo from original Python implementation (still needed for MST computation)
+def prim_algo(adjacency_matrix):
+    n = len(adjacency_matrix)
+    infty = torch.max(adjacency_matrix).item() + 10
+    dst = torch.ones(n, device=adjacency_matrix.device) * infty
+    ancestors = -torch.ones(n, dtype=int, device=adjacency_matrix.device)
+    visited = torch.zeros(n, dtype=bool, device=adjacency_matrix.device)
+    mst_edges = np.zeros((n - 1, 2), dtype=np.int32)
+    mst_weights = np.zeros(n - 1, dtype=np.float32)
+    s, v = adjacency_matrix.new_zeros(()), 0
+    for i in range(n - 1):
+        visited[v] = 1
+        ancestors[dst > adjacency_matrix[v]] = v
+        dst = torch.minimum(dst, adjacency_matrix[v])
+        dst[visited] = infty
+        v = torch.argmin(dst)
+        weight = adjacency_matrix[v][ancestors[v]].item()
+        s += weight
+        mst_edges[i][0] = v
+        mst_edges[i][1] = ancestors[v]
+        mst_weights[i] = weight
+    return s, mst_edges, mst_weights
 
 
 class TSPModel(nn.Module):
@@ -199,6 +224,101 @@ class TSPModel(nn.Module):
 
         return temp_extend_solution
 
+    def _build_edge_weights_from_cpp(self, solver_cpp, barcodes_cpp, r1_mst_np=None, edges_only=None):
+        """
+        Build edge_weights_dict from C++ RTD_Lite results.
+        Similar to build_edge_weights_from_cpp in RTDL_compare_simple.py but with edges_only filtering.
+        """
+        device = solver_cpp.r1.device
+        
+        # Get raw birth/death edge indices from C++ core
+        if r1_mst_np is not None:
+            r1_edge_idx, r1_edge_w = r1_mst_np
+            barcode_l, barcode_r = convert_with_mst(
+                solver_cpp.prog,
+                solver_cpp.r1.cpu().numpy(),
+                solver_cpp.r2.cpu().numpy(),
+                r1_edge_idx,
+                r1_edge_w
+            )
+        else:
+            barcode_l, barcode_r = convert(
+                solver_cpp.prog,
+                "",
+                solver_cpp.r1.cpu().numpy(),
+                solver_cpp.r2.cpu().numpy(),
+            )
+        
+        if barcode_r.size == 0:
+            return {}
+        
+        barcode_r = np.asarray(barcode_r, dtype=np.int64)
+        if barcode_r.ndim == 1:
+            if barcode_r.shape[0] == 4:
+                barcode_r = barcode_r.reshape(1, 4)
+            else:
+                return {}
+        
+        # death edge indices: (death_i, death_j)
+        path_edges_from_barcodes = barcode_r[:, 2:4].astype(np.int32)
+        
+        barcodes_21 = barcodes_cpp.get("2->1", None)
+        if barcodes_21 is None:
+            return {}
+        
+        if isinstance(barcodes_21, list):
+            if len(barcodes_21) == 0:
+                barcodes_21 = torch.tensor([], dtype=torch.float32, device=device).reshape(0, 2)
+            else:
+                barcodes_21 = torch.stack(barcodes_21).to(device)
+        elif isinstance(barcodes_21, torch.Tensor):
+            barcodes_21 = barcodes_21.to(device)
+            if barcodes_21.numel() == 0:
+                barcodes_21 = barcodes_21.reshape(0, 2)
+            elif barcodes_21.dim() == 1:
+                if barcodes_21.shape[0] == 2:
+                    barcodes_21 = barcodes_21.unsqueeze(0)
+                elif barcodes_21.shape[0] % 2 == 0:
+                    barcodes_21 = barcodes_21.reshape(-1, 2)
+                else:
+                    barcodes_21 = torch.tensor([], dtype=torch.float32, device=device).reshape(0, 2)
+        else:
+            barcodes_21 = torch.tensor([], dtype=torch.float32, device=device).reshape(0, 2)
+        
+        n_vertices = solver_cpp.r1.shape[0]
+        regular_barcode_count = min(n_vertices - 1, len(path_edges_from_barcodes), barcodes_21.shape[0])
+        
+        edge_weights_dict = {}
+        # Process regular barcodes (first n-1)
+        for index in range(regular_barcode_count):
+            i, j = path_edges_from_barcodes[index]
+            weight = (barcodes_21[index][1] - barcodes_21[index][0]).item()
+            if abs(weight) > 1e-9:  # Only non-zero weights
+                edge_weights_dict[(int(i), int(j))] = weight
+                edge_weights_dict[(int(j), int(i))] = weight
+        
+        # Add max TSP edge separately (if exists and valid)
+        if barcodes_21.shape[0] > regular_barcode_count:
+            max_barcode_idx = regular_barcode_count
+            max_edge_weight = (barcodes_21[max_barcode_idx][1] - barcodes_21[max_barcode_idx][0]).item()
+            if max_edge_weight > 1e-9:
+                max_TSP_death_i = int(barcode_r[max_barcode_idx, 2])
+                max_TSP_death_j = int(barcode_r[max_barcode_idx, 3])
+                edge_weights_dict[(max_TSP_death_i, max_TSP_death_j)] = max_edge_weight
+                edge_weights_dict[(max_TSP_death_j, max_TSP_death_i)] = max_edge_weight
+        
+        # Filter by edges_only if provided
+        if edges_only is not None:
+            filtered_dict = {}
+            zero = torch.tensor(0.0, device=device)
+            for (u, v) in edges_only:
+                w = edge_weights_dict.get((u, v), zero)
+                weight = float(w) if isinstance(w, (float, int)) else w.item() if isinstance(w, torch.Tensor) else w
+                filtered_dict[(u, v)] = weight
+            edge_weights_dict = filtered_dict
+        
+        return edge_weights_dict
+
     def compute_rtdl_features(self, data, abs_partial_solu_2):
         """
         Compute RTDL(current_solution, Full_Graph) for current partial solution.
@@ -228,7 +348,7 @@ class TSPModel(nn.Module):
                 for bb in range(batch_size):
                     full_edge = torch.cdist(data[bb], data[bb], p=2)  # [V, V]
                     _, mst_edges, mst_w = prim_algo(full_edge.cpu())
-                    order_np = mst_w.argsort().cpu().numpy()
+                    order_np = np.argsort(mst_w)
                     sorted_edges = mst_edges[order_np]
                     sorted_weights = mst_w[order_np]
                     cache['edge_len'].append(full_edge)
@@ -250,16 +370,30 @@ class TSPModel(nn.Module):
                 partial_edge_len[v, u] = edge_len[v, u]
             
             # Compute RTDL(current_solution, Full_Graph) using cached full-graph MST
-            rtdl = RTD_Lite(edge_len, partial_edge_len)
+            # Prepare edges of partial solution to query RTDL directly without dense matrix
+            tour_edges = [(partial_solution[i].item(), partial_solution[(i + 1) % num_partial_nodes].item())
+                          for i in range(num_partial_nodes)]
+            
+            # Use C++ RTD_Lite implementation
+            solver_cpp = RTD_Lite(edge_len, partial_edge_len, quant_outer=1, quant_inner=1, distance="precomputed")
             r1_mst = cache['r1_mst'][b]
-            _, _, rtdl_output = rtdl(r1_mst=r1_mst)  # [V, V]
+            # Convert r1_mst to numpy format for C++ interface
+            r1_edge_idx, r1_edge_w = r1_mst
+            if isinstance(r1_edge_idx, torch.Tensor):
+                r1_edge_idx = r1_edge_idx.cpu().numpy()
+            if isinstance(r1_edge_w, torch.Tensor):
+                r1_edge_w = r1_edge_w.cpu().numpy()
+            r1_mst_np = (r1_edge_idx, r1_edge_w)
+            
+            barcodes = solver_cpp(r1_mst=r1_mst_np)
+            edge_weights_dict = self._build_edge_weights_from_cpp(solver_cpp, barcodes, r1_mst_np=r1_mst_np, edges_only=tour_edges)
             
             # Store weights for edges in current partial solution
             rtdl_cache = {}
-            for i in range(num_partial_nodes):
-                u = partial_solution[i].item()
-                v = partial_solution[(i + 1) % num_partial_nodes].item()
-                weight = rtdl_output[u, v].item()
+            zero = torch.tensor(0.0, device=data.device)
+            for i, (u, v) in enumerate(tour_edges):
+                w = edge_weights_dict.get((u, v), zero)
+                weight = float(w) if isinstance(w, (float, int)) else w.item() if isinstance(w, torch.Tensor) else w
                 rtdl_cache[(u, v)] = weight
             
             rtdl_cache_list.append(rtdl_cache)

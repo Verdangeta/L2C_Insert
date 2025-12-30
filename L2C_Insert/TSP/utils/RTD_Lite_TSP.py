@@ -100,7 +100,9 @@ class RTD_Lite:
         # Find the biggest (maximal) MST edge in the full graph
         # and the smallest edge in the full graph that is larger than biggest_MST_edge_w
         if len(r1_edge_w) > 0:
-            biggest_MST_edge_w = torch.max(r1_edge_w)
+            # Compute max on CPU, then create tensor directly on GPU (avoid CPU->GPU transfer)
+            biggest_MST_edge_w_val = torch.max(r1_edge_w).item()
+            biggest_MST_edge_w = torch.tensor(biggest_MST_edge_w_val, device=self.device)
             valid_edges = self.r1.masked_fill(self.r1 <= biggest_MST_edge_w, float('inf'))
             birth_biggest_TSP_edge = torch.min(valid_edges)
             if torch.isinf(birth_biggest_TSP_edge):
@@ -109,8 +111,8 @@ class RTD_Lite:
             else:
                 birth_biggest_TSP_edge = birth_biggest_TSP_edge
         else:
-            biggest_MST_edge_w = 0.0
-            birth_biggest_TSP_edge = 0.0
+            biggest_MST_edge_w = torch.tensor(0.0, device=self.device)
+            birth_biggest_TSP_edge = torch.tensor(0.0, device=self.device)
 
         # Sort edges and their weights for all three MSTs
         rmin_edge_idx = rmin_edge_idx[rmin_edge_w.argsort()]
@@ -170,7 +172,8 @@ class RTD_Lite:
 
             # Only record barcodes if the death time is after the birth time (i.e., persistence interval exists)
             if death_2 > birth:
-                barcodes_21[barcode_count] = torch.stack((birth, torch.tensor(death_2, device=self.device)))
+                birth_tensor = birth.to(self.device) if isinstance(birth, torch.Tensor) else torch.tensor(birth, device=self.device)
+                barcodes_21[barcode_count] = torch.stack((birth_tensor, torch.tensor(death_2, device=self.device)))
             else:
                 barcodes_21[barcode_count] = torch.tensor((0, 0), device=self.device)
             barcode_count += 1
@@ -181,23 +184,70 @@ class RTD_Lite:
         # Add max edge to barcodes BEFORE stacking into tensor
         max_edge_weight = 0.0
         if self.max_TSP_row_col is not None:
-            max_edge_weight = max(self.max_TSP_len - birth_biggest_TSP_edge, 0)
+            max_len_val = self.max_TSP_len.item() if isinstance(self.max_TSP_len, torch.Tensor) else self.max_TSP_len
+            birth_biggest_val = birth_biggest_TSP_edge.item() if isinstance(birth_biggest_TSP_edge, torch.Tensor) else birth_biggest_TSP_edge
+            max_edge_weight = max(max_len_val - birth_biggest_val, 0)
             # Add corresponding barcode entry for max edge
-            barcodes_21[barcode_count] = torch.tensor((birth_biggest_TSP_edge, self.max_TSP_len), device=self.device) if max_edge_weight > 0 else torch.tensor((0, 0), device=self.device)
+            birth_biggest_tensor = birth_biggest_TSP_edge if isinstance(birth_biggest_TSP_edge, torch.Tensor) else torch.tensor(birth_biggest_TSP_edge, device=self.device)
+            max_len_tensor = self.max_TSP_len if isinstance(self.max_TSP_len, torch.Tensor) else torch.tensor(self.max_TSP_len, device=self.device)
+            barcodes_21[barcode_count] = torch.stack((birth_biggest_tensor, max_len_tensor)) if max_edge_weight > 0 else torch.tensor((0, 0), device=self.device)
             barcode_count += 1
 
         # Trim unused barcode slots
         barcodes['2->1'] = barcodes_21[:barcode_count]
+        
+        # Filter out zero barcodes (where both birth and death are approximately zero)
+        eps = 1e-9
+        if len(barcodes['2->1']) > 0:
+            # Separate regular barcodes (from MST) and max TSP edge barcode
+            # path_edges_from_barcodes has length = len(rmin_edge_idx) = n-1
+            # The last barcode (if exists) is the max TSP edge
+            regular_barcode_count = len(path_edges_from_barcodes)
+            
+            # Filter regular barcodes (those that correspond to path_edges_from_barcodes)
+            if regular_barcode_count > 0:
+                regular_barcodes = barcodes['2->1'][:regular_barcode_count]
+                non_zero_mask_regular = (torch.abs(regular_barcodes[:, 0]) > eps) | (torch.abs(regular_barcodes[:, 1]) > eps)
+                filtered_regular_barcodes = regular_barcodes[non_zero_mask_regular]
+                filtered_path_edges = path_edges_from_barcodes[non_zero_mask_regular.cpu().numpy()]
+            else:
+                filtered_regular_barcodes = torch.tensor([], dtype=torch.float32, device=self.device).reshape(0, 2)
+                filtered_path_edges = np.array([], dtype=np.int32).reshape(0, 2)
+            
+            # Handle max TSP edge barcode separately (if exists)
+            if barcode_count > regular_barcode_count:
+                max_tsp_barcode = barcodes['2->1'][regular_barcode_count:regular_barcode_count+1]
+                # Keep max TSP edge only if it's non-zero
+                if (torch.abs(max_tsp_barcode[0, 0]) > eps) | (torch.abs(max_tsp_barcode[0, 1]) > eps):
+                    barcodes['2->1'] = torch.cat([filtered_regular_barcodes, max_tsp_barcode], dim=0)
+                else:
+                    barcodes['2->1'] = filtered_regular_barcodes
+            else:
+                barcodes['2->1'] = filtered_regular_barcodes
+            
+            # Update path_edges_from_barcodes to filtered version
+            path_edges_from_barcodes = filtered_path_edges
 
         # Build sparse edge weights mapping
+        # Use filtered barcode count after zero filtering
+        filtered_barcode_count = len(barcodes['2->1'])
         edge_weights_dict = {}
-        for index, (i, j) in enumerate(path_edges_from_barcodes[:barcode_count]):
+        
+        # Process regular barcodes (those with corresponding path edges)
+        num_path_edges = len(path_edges_from_barcodes)
+        for index in range(min(filtered_barcode_count, num_path_edges)):
+            i, j = path_edges_from_barcodes[index]
             weight = barcodes['2->1'][index][1] - barcodes['2->1'][index][0]
             edge_weights_dict[(int(i), int(j))] = weight
             edge_weights_dict[(int(j), int(i))] = weight
-        if self.max_TSP_row_col is not None:
-            edge_weights_dict[(int(self.max_TSP_row_col[0]), int(self.max_TSP_row_col[1]))] = max_edge_weight
-            edge_weights_dict[(int(self.max_TSP_row_col[1]), int(self.max_TSP_row_col[0]))] = max_edge_weight
+        
+        # Process max TSP edge barcode separately (if it exists and is non-zero)
+        if self.max_TSP_row_col is not None and filtered_barcode_count > num_path_edges:
+            # The last barcode is the max TSP edge
+            max_tsp_weight = barcodes['2->1'][num_path_edges][1] - barcodes['2->1'][num_path_edges][0]
+            if max_tsp_weight > eps:
+                edge_weights_dict[(int(self.max_TSP_row_col[0]), int(self.max_TSP_row_col[1]))] = max_tsp_weight
+                edge_weights_dict[(int(self.max_TSP_row_col[1]), int(self.max_TSP_row_col[0]))] = max_tsp_weight
 
         if return_matrix:
             # Initialize output tensor for RTDL edge-based weights
@@ -206,7 +256,7 @@ class RTD_Lite:
             for (i, j), w in edge_weights_dict.items():
                 output[i, j] = w
             # Return: barcodes, path edges, dense output
-            return barcodes, path_edges_from_barcodes[:barcode_count], output
+            return barcodes, path_edges_from_barcodes[:filtered_barcode_count], output
         else:
             # If edges_only provided, filter; else return full dict
             if edges_only is not None:
@@ -214,6 +264,6 @@ class RTD_Lite:
                 for (u, v) in edges_only:
                     filtered[(u, v)] = edge_weights_dict.get((u, v), torch.tensor(0.0, device=self.device))
                 edge_weights_dict = filtered
-            return barcodes, path_edges_from_barcodes[:barcode_count], edge_weights_dict
+            return barcodes, path_edges_from_barcodes[:filtered_barcode_count], edge_weights_dict
         # Return kept above
 

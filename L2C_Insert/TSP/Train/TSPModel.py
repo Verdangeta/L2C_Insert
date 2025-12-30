@@ -5,7 +5,34 @@ import math
 import numpy as np
 import os
 import matplotlib.pyplot as plt
-from L2C_Insert.TSP.utils.RTD_Lite_TSP import RTD_Lite, prim_algo
+import time
+from RTDLite import RTD_Lite
+from RTDLite.converter import convert, convert_with_mst
+import numpy as np
+from logging import getLogger
+
+# Import prim_algo from original Python implementation (still needed for MST computation)
+def prim_algo(adjacency_matrix):
+    n = len(adjacency_matrix)
+    infty = torch.max(adjacency_matrix).item() + 10
+    dst = torch.ones(n, device=adjacency_matrix.device) * infty
+    ancestors = -torch.ones(n, dtype=int, device=adjacency_matrix.device)
+    visited = torch.zeros(n, dtype=bool, device=adjacency_matrix.device)
+    mst_edges = np.zeros((n - 1, 2), dtype=np.int32)
+    mst_weights = np.zeros(n - 1, dtype=np.float32)
+    s, v = adjacency_matrix.new_zeros(()), 0
+    for i in range(n - 1):
+        visited[v] = 1
+        ancestors[dst > adjacency_matrix[v]] = v
+        dst = torch.minimum(dst, adjacency_matrix[v])
+        dst[visited] = infty
+        v = torch.argmin(dst)
+        weight = adjacency_matrix[v][ancestors[v]].item()
+        s += weight
+        mst_edges[i][0] = v
+        mst_edges[i][1] = ancestors[v]
+        mst_weights[i] = weight
+    return s, mst_edges, mst_weights
 
 
 class TSPModel(nn.Module):
@@ -213,6 +240,79 @@ class TSPModel(nn.Module):
 
         return temp_extend_solution
 
+    def _build_edge_weights_from_cpp(self, solver_cpp, barcodes_cpp, r1_mst_np=None, edges_only=None):
+        """
+        Build edge_weights_dict from C++ RTD_Lite results.
+        Similar to build_edge_weights_from_cpp in RTDL_compare_simple.py but with edges_only filtering.
+        Uses cached barcode_r from solver_cpp to avoid recomputing convert_with_mst.
+        """
+        device = solver_cpp.r1.device
+        
+        barcode_r = solver_cpp._last_barcode_r_np
+        
+        if barcode_r.size == 0:
+            return {}
+        
+        # death edge indices: (death_i, death_j)
+        path_edges_from_barcodes = barcode_r[:, 2:4].astype(np.int32)
+        
+        barcodes_21 = barcodes_cpp.get("2->1", None)
+        if barcodes_21 is None:
+            return {}
+        
+        if isinstance(barcodes_21, list):
+            if len(barcodes_21) == 0:
+                barcodes_21 = torch.tensor([], dtype=torch.float32, device=device).reshape(0, 2)
+            else:
+                barcodes_21 = torch.stack(barcodes_21).to(device)
+        elif isinstance(barcodes_21, torch.Tensor):
+            barcodes_21 = barcodes_21.to(device)
+            if barcodes_21.numel() == 0:
+                barcodes_21 = barcodes_21.reshape(0, 2)
+            elif barcodes_21.dim() == 1:
+                if barcodes_21.shape[0] == 2:
+                    barcodes_21 = barcodes_21.unsqueeze(0)
+                elif barcodes_21.shape[0] % 2 == 0:
+                    barcodes_21 = barcodes_21.reshape(-1, 2)
+                else:
+                    barcodes_21 = torch.tensor([], dtype=torch.float32, device=device).reshape(0, 2)
+        else:
+            barcodes_21 = torch.tensor([], dtype=torch.float32, device=device).reshape(0, 2)
+        
+        n_vertices = solver_cpp.r1.shape[0]
+        regular_barcode_count = min(n_vertices - 1, len(path_edges_from_barcodes), barcodes_21.shape[0])
+        
+        edge_weights_dict = {}
+        # Process regular barcodes (first n-1)
+        for index in range(regular_barcode_count):
+            i, j = path_edges_from_barcodes[index]
+            weight = (barcodes_21[index][1] - barcodes_21[index][0]).item()
+            if abs(weight) > 1e-9:  # Only non-zero weights
+                edge_weights_dict[(int(i), int(j))] = weight
+                edge_weights_dict[(int(j), int(i))] = weight
+        
+        # Add max TSP edge separately (if exists and valid)
+        if barcodes_21.shape[0] > regular_barcode_count:
+            max_barcode_idx = regular_barcode_count
+            max_edge_weight = (barcodes_21[max_barcode_idx][1] - barcodes_21[max_barcode_idx][0]).item()
+            if max_edge_weight > 1e-9:
+                max_TSP_death_i = int(barcode_r[max_barcode_idx, 2])
+                max_TSP_death_j = int(barcode_r[max_barcode_idx, 3])
+                edge_weights_dict[(max_TSP_death_i, max_TSP_death_j)] = max_edge_weight
+                edge_weights_dict[(max_TSP_death_j, max_TSP_death_i)] = max_edge_weight
+        
+        # Filter by edges_only if provided
+        if edges_only is not None:
+            filtered_dict = {}
+            zero = torch.tensor(0.0, device=device)
+            for (u, v) in edges_only:
+                w = edge_weights_dict.get((u, v), zero)
+                weight = float(w) if isinstance(w, (float, int)) else w.item() if isinstance(w, torch.Tensor) else w
+                filtered_dict[(u, v)] = weight
+            edge_weights_dict = filtered_dict
+        
+        return edge_weights_dict
+
     def compute_rtdl_features(self, data, abs_partial_solu_2):
         """
         Compute RTDL(current_solution, Full_Graph) for current partial solution.
@@ -225,35 +325,50 @@ class TSPModel(nn.Module):
         Returns:
             rtdl_cache: List of dicts, one per batch item. Each dict: {(u, v): weight}
         """
+        start_time = time.time()
         batch_size = data.shape[0]
         problem_size = data.shape[1]
+        
+        # Lazily compute and cache full-graph distance matrix and MST for this batch
+        cache_key = data.data_ptr()  # assumes data tensor is stable within one tour
+        cache = self._rtdl_full_graph_cache
+        if cache is None or cache.get('key') != cache_key:
+            if self.model_params.get('debug_mode', False):
+                from logging import getLogger
+                logger = getLogger(name='trainer')
+                logger.info("[RTDL Debug] Recomputing r1 MST cache for new batch")
+            cache = {'key': cache_key, 'edge_len': [], 'r1_mst': []}
+            for bb in range(batch_size):
+                full_edge = torch.cdist(data[bb], data[bb], p=2).cpu()  # [V, V]
+                full_edge = full_edge.contiguous()
+                _, mst_edges, mst_w = prim_algo(full_edge)
+                # Ensure consistent sizes: MST has n-1 edges (like in test_mst_feature.py)
+                n_vertices = len(full_edge)
+                n_edges_expected = n_vertices - 1
+                if len(mst_edges) != n_edges_expected or len(mst_w) != n_edges_expected:
+                    raise ValueError(f"MST size mismatch: expected {n_edges_expected} edges, got {len(mst_edges)} edges and {len(mst_w)} weights")
+                # Sort edges by weight
+                order_np = np.argsort(mst_w)
+                sorted_edges = mst_edges[order_np]
+                sorted_weights = mst_w[order_np]
+                cache['edge_len'].append(full_edge)
+                cache['r1_mst'].append((sorted_edges, sorted_weights))
+            self._rtdl_full_graph_cache = cache
         
         rtdl_cache_list = []
         
         for b in range(batch_size):
-            coords = data[b]  # [V, 2]
             partial_solution = abs_partial_solu_2[b]  # [num_partial_nodes]
-            
-            # Lazily compute and cache full-graph distance matrix and MST for this batch
-            cache_key = data.data_ptr()  # assumes data tensor is stable within one tour
-            cache = self._rtdl_full_graph_cache
-            if cache is None or cache.get('key') != cache_key:
-                cache = {'key': cache_key, 'edge_len': [], 'r1_mst': []}
-                for bb in range(batch_size):
-                    full_edge = torch.cdist(data[bb], data[bb], p=2)  # [V, V]
-                    _, mst_edges, mst_w = prim_algo(full_edge.cpu())
-                    order_np = mst_w.argsort().cpu().numpy()
-                    sorted_edges = mst_edges[order_np]
-                    sorted_weights = mst_w[order_np]
-                    cache['edge_len'].append(full_edge)
-                    cache['r1_mst'].append((sorted_edges, sorted_weights))
-                self._rtdl_full_graph_cache = cache
 
-            edge_len = cache['edge_len'][b]
+            edge_len = cache['edge_len'][b].clone().contiguous()
+            _, mst_edges, mst_w = prim_algo(edge_len)
+            order_np = np.argsort(mst_w)
+            sorted_edges = mst_edges[order_np]
+            sorted_weights = mst_w[order_np]
             
-            # Create partial solution distance matrix (only edges in partial solution)
-            partial_edge_len = torch.full((problem_size, problem_size), float('inf'), device=data.device)
-            partial_edge_len.fill_diagonal_(0.0)
+
+            partial_edge_len = torch.full((problem_size, problem_size), float('inf'), 
+                                         dtype=edge_len.dtype, device='cpu')
             
             # Add edges from partial solution
             num_partial_nodes = abs_partial_solu_2.shape[1]
@@ -268,9 +383,13 @@ class TSPModel(nn.Module):
             tour_edges = [(partial_solution[i].item(), partial_solution[(i + 1) % num_partial_nodes].item())
                           for i in range(num_partial_nodes)]
 
-            rtdl = RTD_Lite(edge_len, partial_edge_len)
-            r1_mst = cache['r1_mst'][b]
-            _, _, edge_weights_dict = rtdl(r1_mst=r1_mst, edges_only=tour_edges, return_matrix=False)
+            # # Use C++ RTD_Lite implementation
+            solver_cpp = RTD_Lite(edge_len, partial_edge_len, quant_outer=1, quant_inner=1, distance="precomputed")
+
+            r1_edge_idx, r1_edge_w = cache['r1_mst'][b]
+
+            barcodes = solver_cpp(r1_mst=(r1_edge_idx, r1_edge_w))
+            edge_weights_dict = self._build_edge_weights_from_cpp(solver_cpp, barcodes, edges_only=tour_edges)
             
             # Store weights for edges in current partial solution
             rtdl_cache = {}
@@ -340,11 +459,11 @@ class TSPModel(nn.Module):
                 w_mean = sum(all_weights) / len(all_weights) if all_weights else 0.0
                 logger.info(f"[RTDL Debug] Tour RTDL stats: min={w_min:.6f}, max={w_max:.6f}, mean={w_mean:.6f}, edges={len(all_weights)}")
             
-            # Debug logging only when RTDL recomputed (handled at call site)
-            if False:
-                pass
-            
             rtdl_cache_list.append(rtdl_cache)
+        
+        elapsed_time = time.time() - start_time
+        logger = getLogger(name='trainer')
+        logger.info(f"[RTDL Time] RTDL computation took {elapsed_time:.4f} seconds (batch_size={batch_size}, problem_size={problem_size})")
         
         return rtdl_cache_list  # List of dicts: [{(u, v): weight}, ...]
     
