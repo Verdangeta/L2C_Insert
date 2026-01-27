@@ -49,6 +49,7 @@ class TSPEnv:
         self.tsplib_problems = None
         self.problem_max_min = None
         self.episode = None
+        self.use_torus_metric = env_params.get('use_torus_metric', False)
 
     def load_problems(self, episode, batch_size):
         self.episode = episode
@@ -368,9 +369,12 @@ class TSPEnv:
 
             rolled_seq = ordered_seq.roll(dims=1, shifts=-1)
 
-            segment_lengths = ((ordered_seq - rolled_seq) ** 2)
-
-            segment_lengths = segment_lengths.sum(2).sqrt()
+            if self.use_torus_metric:
+                from L2C_Insert.TSP.Test.TSPModel import torus_distance_tensor
+                segment_lengths = torus_distance_tensor(ordered_seq, rolled_seq)
+            else:
+                segment_lengths = ((ordered_seq - rolled_seq) ** 2)
+                segment_lengths = segment_lengths.sum(2).sqrt()
 
             travel_distances = segment_lengths.sum(1)
 
@@ -378,8 +382,12 @@ class TSPEnv:
         gathering_index_student = self.abs_partial_solu_2.unsqueeze(2).expand(-1, self.problems.shape[1], 2)
         ordered_seq_student = self.problems.gather(dim=1, index=gathering_index_student)
         rolled_seq_student = ordered_seq_student.roll(dims=1, shifts=-1)
-        segment_lengths_student = ((ordered_seq_student - rolled_seq_student) ** 2)
-        segment_lengths_student = segment_lengths_student.sum(2).sqrt()
+        if self.use_torus_metric:
+            from L2C_Insert.TSP.Test.TSPModel import torus_distance_tensor
+            segment_lengths_student = torus_distance_tensor(ordered_seq_student, rolled_seq_student)
+        else:
+            segment_lengths_student = ((ordered_seq_student - rolled_seq_student) ** 2)
+            segment_lengths_student = segment_lengths_student.sum(2).sqrt()
         # shape: (batch,problem)
         travel_distances_student = segment_lengths_student.sum(1)
         # shape: (batch)
@@ -401,9 +409,12 @@ class TSPEnv:
 
                 rolled_seq = ordered_seq.roll(dims=1, shifts=-1)
 
-                segment_lengths = ((ordered_seq - rolled_seq) ** 2)
-
-                segment_lengths = segment_lengths.sum(2).sqrt()
+                if self.use_torus_metric:
+                    from L2C_Insert.TSP.Test.TSPModel import torus_distance_tensor
+                    segment_lengths = torus_distance_tensor(ordered_seq, rolled_seq)
+                else:
+                    segment_lengths = ((ordered_seq - rolled_seq) ** 2)
+                    segment_lengths = segment_lengths.sum(2).sqrt()
 
                 travel_distances = segment_lengths.sum(1)
 
@@ -417,9 +428,12 @@ class TSPEnv:
 
             rolled_seq = ordered_seq.roll(dims=1, shifts=-1)
 
-            segment_lengths = ((ordered_seq - rolled_seq) ** 2)
-
-            segment_lengths = segment_lengths.sum(2).sqrt()
+            if self.use_torus_metric:
+                from L2C_Insert.TSP.Test.TSPModel import torus_distance_tensor
+                segment_lengths = torus_distance_tensor(ordered_seq, rolled_seq)
+            else:
+                segment_lengths = ((ordered_seq - rolled_seq) ** 2)
+                segment_lengths = segment_lengths.sum(2).sqrt()
 
             travel_distances = segment_lengths.sum(1)
 

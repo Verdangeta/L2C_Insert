@@ -26,8 +26,8 @@ RRC_budget = 1000         # RRC budget
 
 ########### model to load ###############
 
-model_load_path = './result/20240817_232506_train'
-model_load_epoch = 100
+model_load_path = './result/20260114_042024_train'
+model_load_epoch = 8  # Последний доступный чекпоинт. Если обучение завершилось на эпохе 9, измените на 9
 
 ##########################################################################################
 mode = 'test'
@@ -66,6 +66,8 @@ model_params = {
     'k_nearest_edges': 100,
     'k_nearest_scatter': 100,
     'coor_norm': False,
+    'with_RTDL': True,  # Enable RTDL features (must match training config)
+    'update_RTD': 10,  # Steps between RTDL updates (must match training config)
     'debug_mode': DEBUG_MODE
 }
 

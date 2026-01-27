@@ -32,10 +32,9 @@ b = os.path.abspath("../../..").replace('\\', '/')
 
 ########### model ###############
 mode = 'train'
-model_load_enable = False
-model_load_path = ''
-model_load_epoch = 0
-
+model_load_enable = True
+model_load_path = '/result/20260114_042024_train'
+model_load_epoch = 8
 
 env_params = {
     'test_in_tsplib': False,

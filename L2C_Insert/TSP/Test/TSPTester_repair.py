@@ -98,11 +98,11 @@ class TSPTester():
             elif 1000<=problems_size:
                 problems_1000.append(current_gap)
 
-            print('problems_100 mean gap:',np.mean(problems_100),len(problems_100))
-            print('problems_100_200 mean gap:', np.mean(problems_100_200),len(problems_100_200))
-            print('problems_200_500 mean gap:', np.mean(problems_200_500),len(problems_200_500))
-            print('problems_500_1000 mean gap:', np.mean(problems_500_1000),len(problems_500_1000))
-            print('problems_1000 mean gap:', np.mean(problems_1000),len(problems_1000))
+            print('problems_100 mean gap:', np.mean(problems_100) if len(problems_100) > 0 else 0, len(problems_100))
+            print('problems_100_200 mean gap:', np.mean(problems_100_200) if len(problems_100_200) > 0 else 0, len(problems_100_200))
+            print('problems_200_500 mean gap:', np.mean(problems_200_500) if len(problems_200_500) > 0 else 0, len(problems_200_500))
+            print('problems_500_1000 mean gap:', np.mean(problems_500_1000) if len(problems_500_1000) > 0 else 0, len(problems_500_1000))
+            print('problems_1000 mean gap:', np.mean(problems_1000) if len(problems_1000) > 0 else 0, len(problems_1000))
             score_AM.update(score_teacher, batch_size)
             score_student_AM.update(score_student, batch_size)
 
@@ -128,7 +128,7 @@ class TSPTester():
                 else:
                     self.logger.info(" *** Test Done *** ")
                     all_result_gaps = problems_1000 + problems_500_1000 + problems_200_500 + problems_100_200 + problems_100
-                    average_gap = np.mean(all_result_gaps)
+                    average_gap = np.mean(all_result_gaps) if len(all_result_gaps) > 0 else 0
                     self.logger.info(" Average Gap: {:.4f}%".format(average_gap*100))
                     gap_ = average_gap
 
@@ -182,7 +182,13 @@ class TSPTester():
         problems_sorted_by_solution = problems[tmp_index1, solution]
 
         # 计算所有点距离被选点的距离
-        distance = torch.norm(problems_sorted_by_solution - selected_one_node, dim=-1)
+        # Check if torus metric should be used
+        use_torus_metric = self.model_params.get('use_torus_metric', False)
+        if use_torus_metric:
+            from L2C_Insert.TSP.Test.TSPModel import torus_distance_tensor
+            distance = torus_distance_tensor(problems_sorted_by_solution, selected_one_node)
+        else:
+            distance = torch.norm(problems_sorted_by_solution - selected_one_node, dim=-1)
 
         # distance = manhattan_distance(problems_sorted_by_solution, selected_one_node)
 
@@ -237,6 +243,120 @@ class TSPTester():
 
         return solution, selected_solution_index, unselected_solution_index
 
+    def sampling_subpaths_by_RTDL(self, problems, solution, length_sub):
+        """
+        Sample subpath using RTDL weights to select vertex for destruction.
+        For each vertex in the tour, compute a score based on sum of RTDL weights
+        of neighboring edges (window edges to left and right in the tour).
+        Sample vertex with probability proportional to this score.
+        """
+        problems_size = problems.shape[1]
+        batch_size = problems.shape[0]
+        
+        try:
+            # Compute RTDL for the full tour
+            rtdl_cache = self.model.compute_rtdl_features(problems, solution)
+            
+            # Extract RTDL weights for all edges in the tour
+            rtdl_weights = self.model.extract_rtdl_weights_for_edges(rtdl_cache, solution)
+            # rtdl_weights shape: [B, num_nodes]
+            # rtdl_weights[b, i] = weight for edge (solution[b, i], solution[b, (i+1) % n])
+            
+            # Randomly roll solution to avoid bias
+            mm = torch.randint(low=4, high=problems_size, size=[1])[0].item()
+            solution = torch.roll(solution, shifts=mm, dims=1)
+            
+            # Also roll RTDL weights to match the rolled solution
+            rtdl_weights = torch.roll(rtdl_weights, shifts=mm, dims=1)
+            
+            # Get window size for neighboring edges
+            window = self.env_params.get('rtdl_sampling_window', 2)
+            n = problems_size
+            
+            # Compute score for each vertex position in the tour
+            # Score = sum of RTDL weights of edges in the neighborhood of vertex
+            # For vertex at position i in the tour:
+            # - rtdl_weights[b, j] = weight for edge (solution[b, j], solution[b, (j+1) % n])
+            # - For vertex at position i, we sum RTDL weights of edges with indices:
+            #   (i-window) % n, (i-window+1) % n, ..., (i-1) % n, i, (i+1) % n, ..., (i+window-1) % n
+            # - This includes: window edges before vertex i and window edges after vertex i
+            # - Total: 2*window edges in the neighborhood
+            device = rtdl_weights.device
+            vertex_scores = torch.zeros(n, dtype=torch.float32, device=device)
+            
+            for i in range(n):
+                # Sum RTDL weights of edges within window around vertex i
+                # j ranges from -window to window-1, giving us 2*window edges
+                for j in range(-window, window):
+                    edge_idx = (i + j) % n
+                    vertex_scores[i] += rtdl_weights[0, edge_idx]
+            
+            # Normalize to probabilities
+            # Higher scores = higher probability (higher RTDL weights in neighborhood = more important to repair)
+            # Add small epsilon to avoid division by zero and ensure all vertices have non-zero probability
+            scores_tensor = vertex_scores + 1e-8
+            probs = scores_tensor / scores_tensor.sum()
+            
+            # Sample vertex position based on probabilities
+            # Ensure probabilities sum to 1 (for numerical stability, in case of floating point errors)
+            probs = probs / probs.sum()
+            selected_position = torch.multinomial(probs.unsqueeze(0), 1).item()
+            
+            # Get the selected node index
+            selected_node_index = solution[0, selected_position]
+            
+            # Now proceed with proximity-based selection of k nearest neighbors
+            # (same as in sampling_subpaths_by_Proximity)
+            selected_one_node = problems[:, [selected_node_index], :]
+            
+            # Sort all points by solution order
+            tmp_index1 = torch.arange(batch_size)[:, None].repeat(1, problems_size)
+            problems_sorted_by_solution = problems[tmp_index1, solution]
+            
+            # Compute distances to selected node
+            use_torus_metric = self.model_params.get('use_torus_metric', False)
+            if use_torus_metric:
+                from L2C_Insert.TSP.Test.TSPModel import torus_distance_tensor
+                distance = torus_distance_tensor(problems_sorted_by_solution, selected_one_node)
+            else:
+                distance = torch.norm(problems_sorted_by_solution - selected_one_node, dim=-1)
+            
+            # Sort by distance
+            sorted_distance, sorted_index = torch.sort(distance, dim=1, descending=False)
+            
+            # Select k-nearest
+            sorted_index = sorted_index[:, :length_sub]
+            
+            tmp_index = torch.arange(batch_size)[:, None].repeat(1, length_sub)
+            selected_solution_index = solution[tmp_index, sorted_index]
+            
+            def _get_new_data_v2(data, selected_node_list, prob_size, B_V):
+                new_sulution_ascending, rank = torch.sort(data, dim=-1, descending=False)
+                _, new_sulution_rank = torch.sort(rank, dim=-1, descending=False)
+                
+                list = selected_node_list
+                new_list = torch.arange(prob_size)[None, :].repeat(B_V, 1)
+                new_list_len = prob_size - list.shape[1]
+                
+                index_2 = list.type(torch.long)
+                index_1 = torch.arange(B_V, dtype=torch.long)[:, None].expand(B_V, index_2.shape[1])
+                new_list[index_1, index_2] = -2
+                
+                index_3 = torch.arange(B_V, dtype=torch.long)[:, None].repeat(1, prob_size)
+                new_list = new_list[index_3, new_sulution_rank]
+                
+                unselect_list = new_list[torch.gt(new_list, -1)].view(B_V, new_list_len)
+                return unselect_list
+            
+            unselected_solution_index = _get_new_data_v2(solution, selected_solution_index, problems_size, batch_size)
+            
+            return solution, selected_solution_index, unselected_solution_index
+            
+        except Exception as e:
+            # Fallback to Proximity method if RTDL fails
+            self.logger.warning(f"RTDL sampling failed: {e}. Falling back to Proximity method.")
+            return self.sampling_subpaths_by_Proximity(problems, solution, length_sub)
+
     def check_legalilty(self,best_select_node_list,origin_problem_size):
         out_student = torch.unique(best_select_node_list[0])
         if len(out_student) != origin_problem_size:
@@ -272,6 +392,11 @@ class TSPTester():
             current_step = 0
 
             state, reward, reward_student, done = self.env.pre_step()  # state: data, first_node = current_node
+
+            # RTDL caching: store features for the current batch
+            rtdl_features_cache = None
+            self.model.reset_rtdl_full_graph_cache()
+            update_RTD = self.model_params.get('update_RTD', 10)
 
             IF_random_insertion = self.env_params['random_insertion']
 
@@ -316,10 +441,38 @@ class TSPTester():
                                                                                      last_node_index.reshape(batch_size, 1))
                             scatter_node_coors = self.model.decoder._get_encoding(state.data, self.env.abs_scatter_solu_1)
 
-                            Manhattan_Distance = manhattan_distance(scatter_node_coors, partial_end_node_coor)
+                            # Use torus metric if enabled
+                            use_torus_metric = self.model_params.get('use_torus_metric', False)
+                            if use_torus_metric:
+                                from L2C_Insert.TSP.Test.TSPModel import torus_distance_tensor
+                                Manhattan_Distance = torus_distance_tensor(scatter_node_coors, partial_end_node_coor)
+                            else:
+                                Manhattan_Distance = manhattan_distance(scatter_node_coors, partial_end_node_coor)
 
                             # print(Manhattan_Distance.shape)
                             random_index = torch.argmin(Manhattan_Distance, dim=1).reshape(batch_size, 1)  # [B]
+
+                            # Update RTDL features cache if needed
+                            if self.model.with_RTDL:
+                                # Check if we need to recompute RTDL(current_solution, Full_Graph)
+                                # Update only when: (1) step is multiple of update_RTD, or (2) cache is None
+                                should_update = (
+                                    (current_step % update_RTD == 0) or 
+                                    (rtdl_features_cache is None)
+                                )
+                                
+                                if should_update:
+                                    # Compute RTDL(current_solution, Full_Graph) for current partial solution
+                                    # Returns list of dicts: [{(u, v): weight}, ...] for each batch item
+                                    rtdl_features_cache = self.model.compute_rtdl_features(
+                                        state.data, self.env.abs_partial_solu_2)
+                                
+                                # Extract RTDL weights for current partial solution edges from cache
+                                # Uses cached weights if available, otherwise 0
+                                rtdl_weights = self.model.extract_rtdl_weights_for_edges(
+                                    rtdl_features_cache, self.env.abs_partial_solu_2)
+                            else:
+                                rtdl_weights = None
 
                             abs_partial_solu_2, abs_scatter_solu_1, abs_scatter_solu_1_seleted = self.model( state.data,
                                                                                        self.env.solution,
@@ -327,7 +480,8 @@ class TSPTester():
                                                                                        self.env.abs_partial_solu_2,
                                                                                        random_index,
                                                                                        current_step,
-                                                                                       last_node_index)
+                                                                                       last_node_index,
+                                                                                       rtdl_features=rtdl_weights)
 
                             last_node_index = abs_scatter_solu_1_seleted
                         current_step += 1
@@ -374,12 +528,26 @@ class TSPTester():
                         abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_L2Insert(
                             self.origin_problem, best_select_node_list, curren_length_sub)
                     else:
-                        abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_Proximity(
-                            self.origin_problem, best_select_node_list, curren_length_sub)
+                        # Выбор между Proximity и RTDL
+                        if self.env_params.get('use_rtdl_sampling', False):
+                            abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_RTDL(
+                                self.origin_problem, best_select_node_list, curren_length_sub)
+                        else:
+                            abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_Proximity(
+                                self.origin_problem, best_select_node_list, curren_length_sub)
                 else:
-                    if self.env_params['turn_to_cluster_strategy']:
-                        abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_Proximity(
-                            self.origin_problem, best_select_node_list, curren_length_sub)
+                    if self.env_params.get('turn_to_cluster_strategy', False):
+                        # Проверка типа стратегии
+                        if isinstance(self.env_params['turn_to_cluster_strategy'], str) and \
+                           self.env_params['turn_to_cluster_strategy'] == 'rtdl':
+                            abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_RTDL(
+                                self.origin_problem, best_select_node_list, curren_length_sub)
+                        elif self.env_params.get('use_rtdl_sampling', False):
+                            abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_RTDL(
+                                self.origin_problem, best_select_node_list, curren_length_sub)
+                        else:
+                            abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_Proximity(
+                                self.origin_problem, best_select_node_list, curren_length_sub)
                     else:
                         abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_L2Insert(
                         self.origin_problem, best_select_node_list, curren_length_sub)
@@ -400,6 +568,11 @@ class TSPTester():
 
                 state, reward, reward_student, done = self.env.pre_step()  # state: data, first_node = current_node
 
+                # RTDL caching for RRC cycle
+                rtdl_features_cache_rrc = None
+                self.model.reset_rtdl_full_graph_cache()
+                update_RTD = self.model_params.get('update_RTD', 10)
+
                 # mm = torch.randint(low=0, high=len(self.env.abs_partial_solu_2), size=[1])[0].item()  # in [0,N)
                 # solution = torch.roll(solution, shifts=mm, dims=1)
 
@@ -411,7 +584,13 @@ class TSPTester():
 
                     scatter_node_coors = self.model.decoder._get_encoding(state.data, self.env.abs_scatter_solu_1)
 
-                    Manhattan_Distance = manhattan_distance(scatter_node_coors, partial_end_node_coor)
+                    # Use torus metric if enabled
+                    use_torus_metric = self.model_params.get('use_torus_metric', False)
+                    if use_torus_metric:
+                        from L2C_Insert.TSP.Test.TSPModel import torus_distance_tensor
+                        Manhattan_Distance = torus_distance_tensor(scatter_node_coors, partial_end_node_coor)
+                    else:
+                        Manhattan_Distance = manhattan_distance(scatter_node_coors, partial_end_node_coor)
 
                     random_index = torch.argmin(Manhattan_Distance, dim=1).reshape(batch_size, 1)  # [B]
                     # print(index.shape)
@@ -422,14 +601,38 @@ class TSPTester():
                     # print(f'************************ current step {current_step} ************************')
                     # print('******************************************************************************')
 
+                    # Update RTDL features cache if needed (for RRC cycle)
+                    if self.model.with_RTDL:
+                        # Check if we need to recompute RTDL(current_solution, Full_Graph)
+                        # Update only when: (1) step is multiple of update_RTD, or (2) cache is None
+                        should_update = (
+                            (current_step % update_RTD == 0) or 
+                            (rtdl_features_cache_rrc is None)
+                        )
+                        
+                        if should_update:
+                            # Compute RTDL(current_solution, Full_Graph) for current partial solution
+                            # Returns list of dicts: [{(u, v): weight}, ...] for each batch item
+                            rtdl_features_cache_rrc = self.model.compute_rtdl_features(
+                                state.data, self.env.abs_partial_solu_2)
+                        
+                        # Extract RTDL weights for current partial solution edges from cache
+                        # Uses cached weights if available, otherwise 0
+                        rtdl_weights = self.model.extract_rtdl_weights_for_edges(
+                            rtdl_features_cache_rrc, self.env.abs_partial_solu_2)
+                    else:
+                        rtdl_weights = None
+
                     abs_partial_solu_2, abs_scatter_solu_1, abs_scatter_solu_1_seleted = self.model(state.data,
                                                                                                     self.env.solution,
                                                                                                     self.env.abs_scatter_solu_1,
                                                                                                     self.env.abs_partial_solu_2,
                                                                                                     random_index,
                                                                                                     current_step,
-                                                                                                    last_node_index)
+                                                                                                    last_node_index,
+                                                                                                    rtdl_features=rtdl_weights)
                     last_node_index = abs_scatter_solu_1_seleted
+                    current_step += 1
 
                     state, reward, reward_student, done = self.env.step(abs_scatter_solu_1, abs_partial_solu_2,
                                                                         mode='test')

@@ -25,7 +25,7 @@ import argparse
 
 problem_size = 0      # testing problem size
 
-model_load_path = './result/pretrain/tsp_model.pt'
+model_load_path = '/trinity/home/alexander.mironenko/TDA_tsp/L2C_Insert/L2C_Insert/TSP/Test/result/pretrain/tsp_model.pt'
 
 Use_RRC = True          # decode method: use RRC or not (greedy)
 
@@ -60,7 +60,9 @@ env_params = {
     'max_RRC_range':200,
     'mix_sample_strategy':mix_sample_strategy,
     'turn_to_cluster_strategy':turn_to_cluster_strategy,
-    'random_insertion': False
+    'random_insertion': False,
+    'use_rtdl_sampling': False,
+    'rtdl_sampling_window': 2
 }
 
 
@@ -68,14 +70,17 @@ model_params = {
     'mode': mode,
     'embedding_dim': 128,
     'sqrt_embedding_dim': 128**(1/2),
-    'decoder_layer_num':9,
+    'decoder_layer_num': 9,
     'qkv_dim': 16,
     'head_num': 8,
     'ff_hidden_dim': 512,
     'knearest': True,
     'k_nearest_edges': 100,
     'k_nearest_scatter': 100,
-    'coor_norm': False
+    'coor_norm': False,
+    'with_RTDL': False,  # Enable RTDL features (must match training config)
+    'update_RTD': None,  # Steps between RTDL updates (must match training config)
+    'debug_mode': DEBUG_MODE
 }
 
 tester_params = {
@@ -94,17 +99,20 @@ logger_params = {
 }
 
 def add_common_args(parser):
-    parser.add_argument("--cuda_device_num", type=int, default=0, help="None")
-    parser.add_argument("--problem_size", type=int, default=500, help="None")
-    parser.add_argument("--test_in_tsplib", type=int, default=0, help="None")
-    parser.add_argument("--RRC_budget", type=int, default=0, help="None")
-    parser.add_argument("--RRC_range", type=int, default=100, help="None")
-    parser.add_argument("--random_insertion", type=int, default=0, help="None")
-    parser.add_argument("--knearest", type=int, default=0, help="None")
-    parser.add_argument("--k_nearest_edges", type=int, default=100, help="None")
-    parser.add_argument("--k_nearest_scatter", type=int, default=100, help="None")
-    parser.add_argument("--coor_norm", type=int, default=0, help="None")
-    parser.add_argument("--counter_current", type=int, default=0, help="None")
+    parser.add_argument("--cuda_device_num", type=int, default=0, help="CUDA device number")
+    parser.add_argument("--problem_size", type=int, default=500, help="Problem size")
+    parser.add_argument("--test_in_tsplib", type=int, default=0, help="Test in TSPlib format (1=True, 0=False)")
+    parser.add_argument("--RRC_budget", type=int, default=0, help="RRC budget")
+    parser.add_argument("--RRC_range", type=int, default=100, help="RRC range")
+    parser.add_argument("--random_insertion", type=int, default=0, help="Random insertion (1=True, 0=False)")
+    parser.add_argument("--knearest", type=int, default=0, help="Use k-nearest (1=True, 0=False)")
+    parser.add_argument("--k_nearest_edges", type=int, default=100, help="K nearest edges")
+    parser.add_argument("--k_nearest_scatter", type=int, default=100, help="K nearest scatter")
+    parser.add_argument("--coor_norm", type=int, default=0, help="Coordinate normalization (1=True, 0=False)")
+    parser.add_argument("--with_RTDL", type=int, default=0, help="Use RTDL features (1=True, 0=False)")
+    parser.add_argument("--use_rtdl_sampling", type=int, default=1, help="Use RTDL-based vertex sampling for RRC (1=True, 0=False)")
+    parser.add_argument("--rtdl_sampling_window", type=int, default=4, help="Number of edges left/right to consider for RTDL sampling")
+    parser.add_argument("--counter_current", type=int, default=0, help="Counter current")
 
 
 
@@ -133,12 +141,16 @@ def main_test(path,args,file_name,use_RRC=None,cuda_num=None):
     model_params['k_nearest_scatter'] = args.k_nearest_scatter
     model_params['knearest'] = args.knearest
     model_params['coor_norm'] = args.coor_norm
+    model_params['with_RTDL'] = bool(args.with_RTDL) if hasattr(args, 'with_RTDL') else False
+    model_params['update_RTD'] = 10 if (hasattr(args, 'with_RTDL') and args.with_RTDL) else None
     env_params['data_path'] = b + f"/data/TSP/{test_paras[args.problem_size][0]}"
     env_params['tsplib_path'] = b + f"/data/TSP/{test_paras[args.problem_size][0]}"
     env_params['test_in_tsplib'] = args.test_in_tsplib
     env_params['RRC_budget'] = args.RRC_budget
     env_params['random_insertion'] = args.random_insertion
     env_params['max_RRC_range'] = args.RRC_range
+    env_params['use_rtdl_sampling'] = bool(args.use_rtdl_sampling) if hasattr(args, 'use_rtdl_sampling') else False
+    env_params['rtdl_sampling_window'] = args.rtdl_sampling_window if hasattr(args, 'rtdl_sampling_window') else 2
 
     create_logger(**logger_params)
 

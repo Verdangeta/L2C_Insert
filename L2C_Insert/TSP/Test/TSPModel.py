@@ -7,7 +7,8 @@ import os
 import matplotlib.pyplot as plt
 from RTDLite import RTD_Lite
 from RTDLite.converter import convert, convert_with_mst
-import numpy as np
+# Import RTDL functions from Train version
+from L2C_Insert.TSP.Train.TSPModel import TSPModel as TrainTSPModel
 
 # Import prim_algo from original Python implementation (still needed for MST computation)
 def prim_algo(adjacency_matrix):
@@ -31,6 +32,31 @@ def prim_algo(adjacency_matrix):
         mst_edges[i][1] = ancestors[v]
         mst_weights[i] = weight
     return s, mst_edges, mst_weights
+
+
+def torus_distance_tensor(p1, p2):
+    """
+    Compute torus distance between two tensors of points on unit torus [0,1] x [0,1].
+    
+    Args:
+        p1: torch.Tensor of shape (..., 2) - first points
+        p2: torch.Tensor of shape (..., 2) - second points
+        
+    Returns:
+        torch.Tensor of distances with same shape as p1[..., 0]
+    """
+    # Compute differences
+    dx = p2[..., 0] - p1[..., 0]
+    dy = p2[..., 1] - p1[..., 1]
+    
+    # Apply torus wrapping: if |Δ| > 0.5, use 1 - |Δ|
+    dx_corrected = torch.where(torch.abs(dx) > 0.5, 1.0 - torch.abs(dx), torch.abs(dx))
+    dy_corrected = torch.where(torch.abs(dy) > 0.5, 1.0 - torch.abs(dy), torch.abs(dy))
+    
+    # Euclidean distance with corrected differences
+    distance = torch.sqrt(dx_corrected**2 + dy_corrected**2)
+    
+    return distance
 
 
 class TSPModel(nn.Module):
@@ -320,119 +346,32 @@ class TSPModel(nn.Module):
         return edge_weights_dict
 
     def compute_rtdl_features(self, data, abs_partial_solu_2):
-        """
-        Compute RTDL(current_solution, Full_Graph) for current partial solution.
-        Returns dictionary of edge weights that can be cached.
+        """Delegate to Train.TSPModel.compute_rtdl_features"""
+        # Create temporary Train model instance to access its methods
+        # Share the RTDL cache state
+        if not hasattr(self, '_train_model_rtdl'):
+            self._train_model_rtdl = TrainTSPModel(**self.model_params)
+            self._train_model_rtdl._rtdl_full_graph_cache = self._rtdl_full_graph_cache
         
-        Args:
-            data: coordinates [B, V, 2]
-            abs_partial_solu_2: partial solution node indices [B, num_partial_nodes]
-            
-        Returns:
-            rtdl_cache: List of dicts, one per batch item. Each dict: {(u, v): weight}
-        """
-        batch_size = data.shape[0]
-        problem_size = data.shape[1]
+        # Sync cache state
+        self._train_model_rtdl._rtdl_full_graph_cache = self._rtdl_full_graph_cache
         
-        rtdl_cache_list = []
+        # Call Train version method
+        result = self._train_model_rtdl.compute_rtdl_features(data, abs_partial_solu_2)
         
-        for b in range(batch_size):
-            coords = data[b]  # [V, 2]
-            partial_solution = abs_partial_solu_2[b]  # [num_partial_nodes]
-            
-            # Lazily compute and cache full-graph distance matrix and MST for this batch
-            cache_key = data.data_ptr()  # assumes data tensor is stable within one tour
-            cache = self._rtdl_full_graph_cache
-            if cache is None or cache.get('key') != cache_key:
-                cache = {'key': cache_key, 'edge_len': [], 'r1_mst': []}
-                for bb in range(batch_size):
-                    full_edge = torch.cdist(data[bb], data[bb], p=2)  # [V, V]
-                    _, mst_edges, mst_w = prim_algo(full_edge.cpu())
-                    order_np = np.argsort(mst_w)
-                    sorted_edges = mst_edges[order_np]
-                    sorted_weights = mst_w[order_np]
-                    cache['edge_len'].append(full_edge)
-                    cache['r1_mst'].append((sorted_edges, sorted_weights))
-                self._rtdl_full_graph_cache = cache
-
-            edge_len = cache['edge_len'][b]
-            
-            # Create partial solution distance matrix (only edges in partial solution)
-            partial_edge_len = torch.full((problem_size, problem_size), float('inf'), device=data.device)
-            partial_edge_len.fill_diagonal_(0.0)
-            
-            # Add edges from partial solution
-            num_partial_nodes = abs_partial_solu_2.shape[1]
-            for i in range(num_partial_nodes):
-                u = partial_solution[i].item()
-                v = partial_solution[(i + 1) % num_partial_nodes].item()
-                partial_edge_len[u, v] = edge_len[u, v]
-                partial_edge_len[v, u] = edge_len[v, u]
-            
-            # Compute RTDL(current_solution, Full_Graph) using cached full-graph MST
-            # Prepare edges of partial solution to query RTDL directly without dense matrix
-            tour_edges = [(partial_solution[i].item(), partial_solution[(i + 1) % num_partial_nodes].item())
-                          for i in range(num_partial_nodes)]
-            
-            # Use C++ RTD_Lite implementation
-            solver_cpp = RTD_Lite(edge_len, partial_edge_len, quant_outer=1, quant_inner=1, distance="precomputed")
-            r1_mst = cache['r1_mst'][b]
-            # Convert r1_mst to numpy format for C++ interface
-            r1_edge_idx, r1_edge_w = r1_mst
-            if isinstance(r1_edge_idx, torch.Tensor):
-                r1_edge_idx = r1_edge_idx.cpu().numpy()
-            if isinstance(r1_edge_w, torch.Tensor):
-                r1_edge_w = r1_edge_w.cpu().numpy()
-            r1_mst_np = (r1_edge_idx, r1_edge_w)
-            
-            barcodes = solver_cpp(r1_mst=r1_mst_np)
-            edge_weights_dict = self._build_edge_weights_from_cpp(solver_cpp, barcodes, r1_mst_np=r1_mst_np, edges_only=tour_edges)
-            
-            # Store weights for edges in current partial solution
-            rtdl_cache = {}
-            zero = torch.tensor(0.0, device=data.device)
-            for i, (u, v) in enumerate(tour_edges):
-                w = edge_weights_dict.get((u, v), zero)
-                weight = float(w) if isinstance(w, (float, int)) else w.item() if isinstance(w, torch.Tensor) else w
-                rtdl_cache[(u, v)] = weight
-            
-            rtdl_cache_list.append(rtdl_cache)
+        # Sync cache state back
+        self._rtdl_full_graph_cache = self._train_model_rtdl._rtdl_full_graph_cache
         
-        return rtdl_cache_list  # List of dicts: [{(u, v): weight}, ...]
+        return result
     
     def extract_rtdl_weights_for_edges(self, rtdl_cache_list, abs_partial_solu_2):
-        """
-        Extract RTDL weights for edges in current partial solution from cached dictionary.
-        If edge is not in cache, use 0.
+        """Delegate to Train.TSPModel.extract_rtdl_weights_for_edges"""
+        # Create temporary Train model instance to access its methods
+        if not hasattr(self, '_train_model_rtdl'):
+            self._train_model_rtdl = TrainTSPModel(**self.model_params)
         
-        Args:
-            rtdl_cache_list: List of dicts with cached RTDL weights [{(u, v): weight}, ...]
-            abs_partial_solu_2: partial solution node indices [B, num_partial_nodes]
-            
-        Returns:
-            rtdl_weights: RTDL weights for edges in partial solution [B, num_partial_nodes]
-        """
-        batch_size = len(rtdl_cache_list)
-        num_partial_nodes = abs_partial_solu_2.shape[1]
-        device = abs_partial_solu_2.device
-        
-        rtdl_weights_list = []
-        
-        for b in range(batch_size):
-            partial_solution = abs_partial_solu_2[b]  # [num_partial_nodes]
-            rtdl_cache = rtdl_cache_list[b]  # {(u, v): weight}
-            
-            # Extract RTDL weights for edges in current partial solution
-            edge_weights = torch.zeros(num_partial_nodes, device=device)
-            for i in range(num_partial_nodes):
-                u = partial_solution[i].item()
-                v = partial_solution[(i + 1) % num_partial_nodes].item()
-                # Use cached weight if available, otherwise 0
-                edge_weights[i] = rtdl_cache.get((u, v), 0.0)
-            
-            rtdl_weights_list.append(edge_weights)
-        
-        return torch.stack(rtdl_weights_list)  # [B, num_partial_nodes]
+        # Call Train version method
+        return self._train_model_rtdl.extract_rtdl_weights_for_edges(rtdl_cache_list, abs_partial_solu_2)
 
 
 ########################################
@@ -461,10 +400,13 @@ class TSP_Decoder(nn.Module):
         self.model_params = model_params
         embedding_dim = self.model_params['embedding_dim']
         encoder_layer_num = self.model_params['decoder_layer_num']
+        with_RTDL = self.model_params.get('with_RTDL', False)
 
         self.embedding_last_node = nn.Linear(embedding_dim, embedding_dim, bias=True)
-        # embedding_dim*2 + 1 to include RTDL weight
-        self.embedding_partial_node = nn.Linear(embedding_dim*2 + 1, embedding_dim, bias=True)
+        # embedding_dim*2 + 1 to include RTDL weight (if with_RTDL=True)
+        # embedding_dim*2 if with_RTDL=False
+        input_dim = embedding_dim * 2 + (1 if with_RTDL else 0)
+        self.embedding_partial_node = nn.Linear(input_dim, embedding_dim, bias=True)
         self.embedding_scatter_node = nn.Linear(embedding_dim, embedding_dim, bias=True)
 
         self.layers = nn.ModuleList([DecoderLayer(**model_params) for _ in range(encoder_layer_num)])
@@ -505,11 +447,16 @@ class TSP_Decoder(nn.Module):
             # 每条边对应两个点
             # 这两个点都与 scatter_node_selected算距离，取最小值
             # 然后排序。
+            use_torus_metric = self.model_params.get('use_torus_metric', False)
+            
             if partial_nodes_coor_number > k_nearest_edges:
 
                 partial_nodes_coor = partial_nodes_coor
 
-                distance1 = torch.norm(partial_nodes_coor - current_node_coor, dim=2)
+                if use_torus_metric:
+                    distance1 = torus_distance_tensor(partial_nodes_coor, current_node_coor)
+                else:
+                    distance1 = torch.norm(partial_nodes_coor - current_node_coor, dim=2)
 
                 distance2 = torch.roll(distance1, dims=1, shifts=-1)
                 distances = torch.cat((distance1.unsqueeze(2), distance2.unsqueeze(2)), dim=2)
@@ -519,7 +466,10 @@ class TSP_Decoder(nn.Module):
                 left_partial_nodes_coor2 = self._get_encoding(left_partial_nodes_coor2, sort_index).clone().detach()
 
             if unseleted_scatter_coor_number > k_nearest_scatter:
-                distance3 = torch.norm(unseleted_scatter_coor - current_node_coor, dim=2)
+                if use_torus_metric:
+                    distance3 = torus_distance_tensor(unseleted_scatter_coor, current_node_coor)
+                else:
+                    distance3 = torch.norm(unseleted_scatter_coor - current_node_coor, dim=2)
                 _, sort_index2 = torch.topk(distance3, dim=1, k=k_nearest_scatter, largest=False)
                 unseleted_scatter_coor = self._get_encoding(unseleted_scatter_coor, sort_index2).clone().detach()
 
@@ -549,24 +499,27 @@ class TSP_Decoder(nn.Module):
 
             left_encoded_node = torch.cat((enc_partial_nodes1,enc_partial_nodes2), dim=2)
 
-            # Add RTDL weights if available
-            if rtdl_features is not None:
-                # rtdl_features: [B, num_partial_nodes]
-                # We need to add RTDL weight for each edge (between consecutive nodes)
-                # Note: when knearest is used, we might have fewer edges
-                if left_encoded_node.shape[1] == rtdl_features.shape[1]:
-                    rtdl_weights = rtdl_features.unsqueeze(-1)  # [B, num_partial_nodes, 1]
-                    left_encoded_node = torch.cat((left_encoded_node, rtdl_weights), dim=2)
+            # Add RTDL weights if available and RTDL is enabled
+            with_RTDL = self.model_params.get('with_RTDL', False)
+            if with_RTDL:
+                if rtdl_features is not None:
+                    # rtdl_features: [B, num_partial_nodes]
+                    # We need to add RTDL weight for each edge (between consecutive nodes)
+                    # Note: when knearest is used, we might have fewer edges
+                    if left_encoded_node.shape[1] == rtdl_features.shape[1]:
+                        rtdl_weights = rtdl_features.unsqueeze(-1)  # [B, num_partial_nodes, 1]
+                        left_encoded_node = torch.cat((left_encoded_node, rtdl_weights), dim=2)
+                    else:
+                        # If dimensions don't match (knearest case), use zeros
+                        batch_size, num_edges, _ = left_encoded_node.shape
+                        zeros = torch.zeros(batch_size, num_edges, 1, device=left_encoded_node.device)
+                        left_encoded_node = torch.cat((left_encoded_node, zeros), dim=2)
                 else:
-                    # If dimensions don't match (knearest case), use zeros
+                    # If RTDL is enabled but features not provided, add zeros
                     batch_size, num_edges, _ = left_encoded_node.shape
                     zeros = torch.zeros(batch_size, num_edges, 1, device=left_encoded_node.device)
                     left_encoded_node = torch.cat((left_encoded_node, zeros), dim=2)
-            else:
-                # If RTDL is not used, add zeros
-                batch_size, num_edges, _ = left_encoded_node.shape
-                zeros = torch.zeros(batch_size, num_edges, 1, device=left_encoded_node.device)
-                left_encoded_node = torch.cat((left_encoded_node, zeros), dim=2)
+            # If with_RTDL=False, don't add RTDL dimension (left_encoded_node stays embedding_dim*2)
 
             left_encoded_node = self.embedding_partial_node(left_encoded_node)
 
@@ -615,16 +568,19 @@ class TSP_Decoder(nn.Module):
 
             left_encoded_node = torch.cat((left_encoded_node, torch.roll(left_encoded_node, dims=1, shifts=-1)), dim=2)
 
-            # Add RTDL weights if available
-            if rtdl_features is not None:
-                # rtdl_features: [B, num_partial_nodes]
-                rtdl_weights = rtdl_features.unsqueeze(-1)  # [B, num_partial_nodes, 1]
-                left_encoded_node = torch.cat((left_encoded_node, rtdl_weights), dim=2)
-            else:
-                # If RTDL is not used, add zeros
-                batch_size, num_edges, _ = left_encoded_node.shape
-                zeros = torch.zeros(batch_size, num_edges, 1, device=left_encoded_node.device)
-                left_encoded_node = torch.cat((left_encoded_node, zeros), dim=2)
+            # Add RTDL weights if available and RTDL is enabled
+            with_RTDL = self.model_params.get('with_RTDL', False)
+            if with_RTDL:
+                if rtdl_features is not None:
+                    # rtdl_features: [B, num_partial_nodes]
+                    rtdl_weights = rtdl_features.unsqueeze(-1)  # [B, num_partial_nodes, 1]
+                    left_encoded_node = torch.cat((left_encoded_node, rtdl_weights), dim=2)
+                else:
+                    # If RTDL is enabled but features not provided, add zeros
+                    batch_size, num_edges, _ = left_encoded_node.shape
+                    zeros = torch.zeros(batch_size, num_edges, 1, device=left_encoded_node.device)
+                    left_encoded_node = torch.cat((left_encoded_node, zeros), dim=2)
+            # If with_RTDL=False, don't add RTDL dimension (left_encoded_node stays embedding_dim*2)
 
             left_encoded_node = self.embedding_partial_node(left_encoded_node)
 

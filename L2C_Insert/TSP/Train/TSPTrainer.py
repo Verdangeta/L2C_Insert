@@ -67,7 +67,10 @@ class TSPTrainer:
             self.start_epoch = 1 + model_load['epoch']
             self.result_log.set_raw_data(checkpoint['result_log'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.last_epoch = model_load['epoch'] - 1
+            if 'scheduler_state_dict' in checkpoint:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            else:
+                self.scheduler.last_epoch = model_load['epoch'] - 1
             self.logger.info('Saved Model Loaded !!')
         # capturable=True only works with CUDA tensors
         if USE_CUDA:

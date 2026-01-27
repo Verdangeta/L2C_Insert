@@ -39,7 +39,7 @@ def add_common_args(parser):
 
 problem_size = 100      # testing problem size
 
-model_load_path = './result/pretrain/tsp_model.pt'
+model_load_path = '../Train/result/20260114_042024_train/checkpoint-8.pt'
 
 Use_RRC = True          # decode method: use RRC or not (greedy)
 RRC_budget = 1000       # RRC budget
@@ -95,7 +95,10 @@ model_params = {
     'knearest': True,
     'k_nearest_edges': 100,
     'k_nearest_scatter': 100,
-    'coor_norm': False
+    'coor_norm': False,
+    'with_RTDL': True,  # Enable RTDL features (must match training config)
+    'update_RTD': 10,  # Steps between RTDL updates (must match training config)
+    'debug_mode': DEBUG_MODE
 }
 
 tester_params = {
