@@ -34,6 +34,22 @@ def prim_algo(adjacency_matrix):
     return s, mst_edges, mst_weights
 
 
+def torus_pairwise_distance(points):
+    """
+    Compute pairwise torus distances for points on unit torus [0,1] x [0,1].
+
+    Args:
+        points: torch.Tensor [V, 2]
+
+    Returns:
+        torch.Tensor [V, V] with torus distances.
+    """
+    diff = points[:, None, :] - points[None, :, :]  # [V, V, 2]
+    abs_diff = torch.abs(diff)
+    wrapped = torch.minimum(abs_diff, 1.0 - abs_diff)
+    return torch.sqrt((wrapped ** 2).sum(dim=-1))
+
+
 class TSPModel(nn.Module):
 
     def __init__(self, **model_params):
@@ -264,6 +280,9 @@ class TSPModel(nn.Module):
         cache_time = 0.0
         if cache is None or cache.get('key') != cache_key:
             cache_start = time.time()
+            use_torus_metric = self.model_params.get('use_torus_metric', False)
+            metric_name = "torus" if use_torus_metric else "euclidean"
+            logger.info(f"[RTDL] Recomputing full-graph cache with metric={metric_name}")
             # logger.info(f"[RTDL Time] Recalculating r1 MST cache for new batch")
             if self.model_params.get('debug_mode', False):
                 from logging import getLogger
@@ -274,7 +293,10 @@ class TSPModel(nn.Module):
             mst_time = 0.0
             for bb in range(batch_size):
                 cdist_start = time.time()
-                full_edge = torch.cdist(data[bb], data[bb], p=2).cpu()  # [V, V]
+                if use_torus_metric:
+                    full_edge = torus_pairwise_distance(data[bb]).cpu()  # [V, V]
+                else:
+                    full_edge = torch.cdist(data[bb], data[bb], p=2).cpu()  # [V, V]
                 full_edge = full_edge.contiguous()
                 cdist_time += time.time() - cdist_start
                 

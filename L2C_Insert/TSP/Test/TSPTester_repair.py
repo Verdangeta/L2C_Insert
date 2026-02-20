@@ -3,12 +3,22 @@ from logging import getLogger
 
 import numpy as np
 import torch
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    plt = None
+    Circle = None
+    MATPLOTLIB_AVAILABLE = False
 
 from L2C_Insert.TSP.Test.TSPModel import TSPModel as Model
 from L2C_Insert.TSP.Test.TSPEnv import TSPEnv as Env
 from L2C_Insert.TSP.utils.utils import *
+from L2C_Insert.TSP.utils.kruskal_tsp_rtdl import kruskal_tsp, kruskal_tsp_rtdl
 import random
 import os
+import json
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 class TSPTester():
@@ -59,6 +69,219 @@ class TSPTester():
         # utility
         self.time_estimator = TimeEstimator()
         self.time_estimator_2 =  TimeEstimator()
+        # Counter for periodic RTDL sampling diagnostics in logs.
+        self._rtdl_sampling_log_counter = 0
+
+    def _save_final_solutions(self, episode, batch_size, best_select_node_list, current_best_length):
+        """
+        Save final model solutions for the processed batch.
+        """
+        if not self.tester_params.get('save_final_solutions', True):
+            return
+
+        save_dir = self.tester_params.get(
+            'final_solutions_dir',
+            os.path.join(self.result_folder, 'final_solutions')
+        )
+        os.makedirs(save_dir, exist_ok=True)
+
+        start_episode = int(episode)
+        end_episode = int(episode + batch_size - 1)
+        raw_instance_id = self.tester_params.get('instance_id', 'instance')
+        safe_instance_id = ''.join(ch if (ch.isalnum() or ch in ('-', '_')) else '_' for ch in str(raw_instance_id))
+        save_path = os.path.join(
+            save_dir,
+            f'final_solutions_{safe_instance_id}_{start_episode:06d}_{end_episode:06d}.pt'
+        )
+
+        payload = {
+            'episode_start': start_episode,
+            'episode_end': end_episode,
+            'batch_size': int(batch_size),
+            'problem_size': int(self.origin_problem_size),
+            'test_in_tsplib': bool(self.env.test_in_tsplib),
+            'instance_name': self.tester_params.get('instance_id', self.env_params.get('tsplib_path')),
+            'formatted_instance_path': self.env_params.get('tsplib_path'),
+            'instance_metadata': self.tester_params.get('instance_metadata'),
+            'origin_problem_coords': self.origin_problem.detach().cpu(),
+            'solutions': best_select_node_list.detach().cpu(),
+            'student_lengths': current_best_length.detach().cpu(),
+            'optimal_lengths': self.optimal_length.detach().cpu(),
+        }
+        torch.save(payload, save_path)
+        self.logger.info(f"Saved final solutions to: {save_path}")
+        self._draw_final_solution_tours(
+            save_dir=save_dir,
+            save_base=os.path.splitext(os.path.basename(save_path))[0],
+            solutions=payload['solutions'],
+            coords_tensor=payload['origin_problem_coords'],
+            student_lengths=payload['student_lengths'],
+            optimal_lengths=payload['optimal_lengths'],
+            instance_name=payload['instance_name'],
+            instance_metadata=payload.get('instance_metadata'),
+            formatted_instance_path=payload.get('formatted_instance_path'),
+        )
+
+    def _draw_final_solution_tours(
+        self,
+        save_dir,
+        save_base,
+        solutions,
+        coords_tensor,
+        student_lengths,
+        optimal_lengths,
+        instance_name,
+        instance_metadata=None,
+        formatted_instance_path=None,
+    ):
+        """
+        Draw final tour(s) and save them next to final solution files.
+        """
+        if not self.tester_params.get('save_final_solution_plots', True):
+            return
+        if not MATPLOTLIB_AVAILABLE:
+            self.logger.warning(
+                "Skipping final solution plots because matplotlib is not installed."
+            )
+            return
+
+        coords_np = coords_tensor.detach().cpu().numpy()
+        solutions_np = solutions.detach().cpu().numpy().astype(np.int64)
+        student_np = student_lengths.detach().cpu().numpy()
+        optimal_np = optimal_lengths.detach().cpu().numpy()
+        batch = solutions_np.shape[0]
+
+        mirrored_layout = (
+            isinstance(instance_metadata, dict) and
+            instance_metadata.get('layout') == 'mirrored_polylines'
+        )
+        explosion_layout = (
+            isinstance(instance_metadata, dict) and
+            instance_metadata.get('layout') == 'explosion'
+        )
+
+        concorde_tour = None
+        concorde_cost = None
+        if formatted_instance_path:
+            concorde_tour_path = str(formatted_instance_path).replace('_formatted.txt', '_concorde_tour.json')
+            if os.path.exists(concorde_tour_path):
+                try:
+                    with open(concorde_tour_path, 'r') as f:
+                        concorde_payload = json.load(f)
+                    parsed_tour = concorde_payload.get('tour')
+                    if isinstance(parsed_tour, list):
+                        concorde_tour = np.asarray(parsed_tour, dtype=np.int64)
+                    parsed_cost = concorde_payload.get('optimal_cost')
+                    if parsed_cost is not None:
+                        concorde_cost = float(parsed_cost)
+                except Exception as e:
+                    self.logger.warning(f"Failed to load Concorde tour file: {concorde_tour_path}, error: {e}")
+
+        endpoint_points = []
+        if mirrored_layout:
+            for key in ('curve1_start', 'curve1_end', 'curve2_start', 'curve2_end'):
+                val = instance_metadata.get(key)
+                if isinstance(val, (list, tuple)) and len(val) == 2:
+                    endpoint_points.append((float(val[0]), float(val[1]), key))
+
+        explosion_regions = []
+        if explosion_layout:
+            regions = instance_metadata.get('explosion_regions', [])
+            if isinstance(regions, list):
+                for idx_region, region in enumerate(regions):
+                    if not isinstance(region, dict):
+                        continue
+                    center = region.get('center')
+                    radius = region.get('radius')
+                    if (
+                        isinstance(center, (list, tuple)) and len(center) == 2 and
+                        isinstance(radius, (int, float))
+                    ):
+                        explosion_regions.append(
+                            (float(center[0]), float(center[1]), float(radius), idx_region)
+                        )
+
+        for idx in range(batch):
+            coords = coords_np[idx]
+            tour = solutions_np[idx]
+            ordered = coords[tour]
+            closed = np.vstack([ordered, ordered[0]])
+
+            fig, ax = plt.subplots(figsize=(8, 8))
+            ax.scatter(coords[:, 0], coords[:, 1], s=16, c='tab:blue', alpha=0.85, label='Nodes')
+            ax.plot(closed[:, 0], closed[:, 1], '-', lw=1.2, c='tab:red', alpha=0.9, label='Tour')
+            ax.scatter(
+                closed[0, 0], closed[0, 1],
+                s=70, c='black', marker='*', zorder=6, label='Tour start'
+            )
+            if concorde_tour is not None and len(concorde_tour) == coords.shape[0]:
+                concorde_ordered = coords[concorde_tour]
+                concorde_closed = np.vstack([concorde_ordered, concorde_ordered[0]])
+                ax.plot(
+                    concorde_closed[:, 0],
+                    concorde_closed[:, 1],
+                    '--',
+                    lw=1.3,
+                    c='tab:green',
+                    alpha=0.95,
+                    label='Concorde optimal tour',
+                )
+
+            if mirrored_layout and len(endpoint_points) > 0:
+                for px, py, pkey in endpoint_points:
+                    ax.scatter([px], [py], s=90, marker='X', c='tab:green', zorder=7)
+                    ax.annotate(
+                        pkey, (px, py), textcoords='offset points', xytext=(4, 4),
+                        fontsize=8, color='tab:green'
+                    )
+            if explosion_layout and len(explosion_regions) > 0:
+                for cx, cy, radius, idx_region in explosion_regions:
+                    circle = Circle(
+                        (cx, cy),
+                        radius,
+                        fill=True,
+                        alpha=0.18,
+                        facecolor='tab:orange',
+                        edgecolor='tab:orange',
+                        linestyle='--',
+                        linewidth=1.5,
+                        zorder=1,
+                    )
+                    ax.add_patch(circle)
+                    ax.scatter([cx], [cy], s=90, marker='*', c='tab:orange', zorder=7)
+                    ax.annotate(
+                        f'exp{idx_region + 1}',
+                        (cx, cy),
+                        textcoords='offset points',
+                        xytext=(4, 4),
+                        fontsize=8,
+                        color='tab:orange',
+                    )
+
+            stu_len = float(student_np[idx]) if idx < len(student_np) else float('nan')
+            opt_len = float(optimal_np[idx]) if idx < len(optimal_np) else float('nan')
+            gap_pct = ((stu_len - opt_len) / opt_len * 100.0) if opt_len != 0 else float('nan')
+            concorde_text = ""
+            if concorde_cost is not None:
+                concorde_text = f", concorde_opt={concorde_cost:.4f}"
+            ax.set_title(
+                f'Final tour: {instance_name} | N={coords.shape[0]} | '
+                f'stu={stu_len:.4f}, ref={opt_len:.4f}, gap={gap_pct:.3f}%{concorde_text}'
+            )
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_xlabel('x')
+            ax.set_ylabel('y')
+            ax.set_aspect('equal', adjustable='box')
+            ax.grid(alpha=0.25)
+            ax.legend(loc='best')
+
+            plot_name = f'{save_base}_plot.png' if batch == 1 else f'{save_base}_plot_{idx:03d}.png'
+            plot_path = os.path.join(save_dir, plot_name)
+            fig.tight_layout()
+            fig.savefig(plot_path, dpi=180)
+            plt.close(fig)
+            self.logger.info(f"Saved final solution plot: {plot_path}")
 
     def run(self):
         self.time_estimator.reset()
@@ -291,19 +514,62 @@ class TSPTester():
                     edge_idx = (i + j) % n
                     vertex_scores[i] += rtdl_weights[0, edge_idx]
             
-            # Normalize to probabilities
-            # Higher scores = higher probability (higher RTDL weights in neighborhood = more important to repair)
-            # Add small epsilon to avoid division by zero and ensure all vertices have non-zero probability
-            scores_tensor = vertex_scores + 1e-8
-            probs = scores_tensor / scores_tensor.sum()
+            # Convert scores to probabilities with temperature-scaled softmax.
+            # Lower temperature -> sharper distribution; higher temperature -> flatter.
+            temperature = float(self.env_params.get('rtdl_sampling_temperature', 1.0))
+            if temperature <= 0:
+                raise ValueError(f"rtdl_sampling_temperature must be > 0, got {temperature}")
+
+            # Subtract max for numerical stability before softmax.
+            scores_scaled = vertex_scores / temperature
+            scores_scaled = scores_scaled - scores_scaled.max()
+            probs = torch.softmax(scores_scaled, dim=0)
             
             # Sample vertex position based on probabilities
-            # Ensure probabilities sum to 1 (for numerical stability, in case of floating point errors)
-            probs = probs / probs.sum()
             selected_position = torch.multinomial(probs.unsqueeze(0), 1).item()
             
             # Get the selected node index
             selected_node_index = solution[0, selected_position]
+
+            # Optional diagnostics in logs when RTDL sampling is enabled.
+            # Keep logging periodic to avoid flooding when RRC budget is large.
+            if self.env_params.get('use_rtdl_sampling', False):
+                self._rtdl_sampling_log_counter += 1
+                log_every = int(self.env_params.get('rtdl_sampling_log_every', 50))
+                should_log = (
+                    self._rtdl_sampling_log_counter <= 3 or
+                    (log_every > 0 and self._rtdl_sampling_log_counter % log_every == 0)
+                )
+                if should_log:
+                    top_k = min(3, n)
+                    top_probs, top_pos = torch.topk(probs, k=top_k)
+                    top_nodes = solution[0, top_pos]
+                    # Entropy is a compact indicator of distribution sharpness.
+                    entropy = -(probs * torch.log(probs + 1e-12)).sum().item()
+                    self.logger.info(
+                        "[RTDL sampling] step=%d temp=%.4f window=%d "
+                        "score[min/mean/max]=[%.6f/%.6f/%.6f] "
+                        "prob[min/max]=[%.6f/%.6f] entropy=%.6f "
+                        "selected=(pos:%d,node:%d,p:%.6f) "
+                        "top%d=%s",
+                        self._rtdl_sampling_log_counter,
+                        temperature,
+                        window,
+                        vertex_scores.min().item(),
+                        vertex_scores.mean().item(),
+                        vertex_scores.max().item(),
+                        probs.min().item(),
+                        probs.max().item(),
+                        entropy,
+                        selected_position,
+                        int(selected_node_index.item()),
+                        probs[selected_position].item(),
+                        top_k,
+                        [
+                            (int(top_pos[i].item()), int(top_nodes[i].item()), float(top_probs[i].item()))
+                            for i in range(top_k)
+                        ],
+                    )
             
             # Now proceed with proximity-based selection of k nearest neighbors
             # (same as in sampling_subpaths_by_Proximity)
@@ -370,6 +636,7 @@ class TSPTester():
         with torch.no_grad():
 
             if self.env.test_in_tsplib:
+                print(f"    [DEBUG] load_problems_lib...", flush=True)
                 self.env.load_problems_lib(episode, batch_size)
             else:
 
@@ -382,10 +649,65 @@ class TSPTester():
             reset_state, _, _ = self.env.reset(self.env_params['mode'])
 
             if self.env.test_in_tsplib:
-                self.optimal_length, name = self.env._get_travel_distance_2(self.origin_problem, self.env.solution,need_optimal=True)
+                # For TSPlib instances, optimal_length is the known optimal tour length.
+                self.optimal_length, name = self.env._get_travel_distance_2(
+                    self.origin_problem, self.env.solution, need_optimal=True
+                )
             else:
                 self.optimal_length = self.env._get_travel_distance_2(self.origin_problem, self.env.solution)
                 name = 'TSP_visual_1'+str(self.origin_problem.shape[1])
+
+            # # ------------------------------------------------------------------
+            # # Baseline heuristics on TSPlib: classical Kruskal-TSP and RTDL-Kruskal
+            # # (optional; L2C does not use these, only for logging/comparison)
+            # # ------------------------------------------------------------------
+            # if self.env.test_in_tsplib and not self.env_params.get('skip_baselines', False):
+            #     # TSPlib loader currently uses batch_size == 1; we evaluate baselines on that instance.
+            #     coords_norm = self.origin_problem[0]  # [V, 2], normalized
+            #     # De-normalize to original coordinate scale (to be comparable with tsplib_cost).
+            #     max_val, min_val = self.env.problem_max_min
+            #     coords = coords_norm * (max_val - min_val) + min_val  # [V, 2]
+
+            #     # Build Euclidean distance matrix on the original coordinates.
+            #     # Use the same device as coords, kruskal_* handle CPU/GPU internally.
+            #     dist_matrix = torch.cdist(coords, coords, p=2)
+
+            #     def _tour_length_from_coords(points: torch.Tensor, tour: torch.Tensor) -> float:
+            #         """
+            #         Compute total Euclidean length of a closed tour on given coordinates.
+
+            #         points: [V, 2]
+            #         tour:   [V+1], indices into points, tour[0] == tour[-1]
+            #         """
+            #         ordered = points[tour[:-1]]
+            #         rolled = points[tour[1:]]
+            #         seg_len = (ordered - rolled).pow(2).sum(-1).sqrt()
+            #         return float(seg_len.sum().item())
+
+            #     # Classical Kruskal-TSP (length-based).
+            #     tour_kruskal, _ = kruskal_tsp(dist_matrix)
+            #     len_kruskal = _tour_length_from_coords(coords, tour_kruskal.cpu())
+
+            #     # RTDL-based Kruskal-TSP.
+            #     tour_rtdl, _ = kruskal_tsp_rtdl(dist_matrix)
+            #     len_rtdl = _tour_length_from_coords(coords, tour_rtdl.cpu())
+
+            #     opt_val = float(self.optimal_length.mean().item())
+            #     gap_kruskal = (len_kruskal - opt_val) / opt_val * 100.0
+            #     gap_rtdl = (len_rtdl - opt_val) / opt_val * 100.0
+
+            #     self.logger.info(
+            #         "TSPlib baseline ({}): optimal={:.6f}, "
+            #         "Kruskal_TSP len={:.6f}, gap={:.4f}%, "
+            #         "Kruskal_TSP_RTDT len={:.6f}, gap={:.4f}%".format(
+            #             name[0] if hasattr(name, "__len__") and len(name) > 0 else name,
+            #             opt_val,
+            #             len_kruskal,
+            #             gap_kruskal,
+            #             len_rtdl,
+            #             gap_rtdl,
+            #         )
+            #     )
 
             B_V = batch_size * 1
 
@@ -669,6 +991,12 @@ class TSPTester():
 
             self.check_legalilty(best_select_node_list, self.origin_problem_size)
             current_best_length = self.env._get_travel_distance_2(self.origin_problem, best_select_node_list)
+            self._save_final_solutions(
+                episode=episode,
+                batch_size=batch_size,
+                best_select_node_list=best_select_node_list,
+                current_best_length=current_best_length,
+            )
             gap = (current_best_length.mean() - self.optimal_length.mean()) / self.optimal_length.mean() * 100
 
             return self.optimal_length.mean().item(),current_best_length.mean().item(), self.origin_problem_size
