@@ -62,7 +62,9 @@ env_params = {
     'turn_to_cluster_strategy':turn_to_cluster_strategy,
     'random_insertion': False,
     'use_rtdl_sampling': False,
-    'rtdl_sampling_window': 2
+    'rtdl_sampling_window': 2,
+    'rtdl_sampling_temperature': 1.0,
+    'rtdl_sampling_log_every': 50
 }
 
 
@@ -112,6 +114,8 @@ def add_common_args(parser):
     parser.add_argument("--with_RTDL", type=int, default=0, help="Use RTDL features (1=True, 0=False)")
     parser.add_argument("--use_rtdl_sampling", type=int, default=1, help="Use RTDL-based vertex sampling for RRC (1=True, 0=False)")
     parser.add_argument("--rtdl_sampling_window", type=int, default=4, help="Number of edges left/right to consider for RTDL sampling")
+    parser.add_argument("--rtdl_sampling_temperature", type=float, default=1.0, help="Softmax temperature for RTDL-based vertex sampling (>0)")
+    parser.add_argument("--rtdl_sampling_log_every", type=int, default=50, help="Log RTDL sampling diagnostics every N calls (<=0 disables periodic logs, first 3 still logged)")
     parser.add_argument("--counter_current", type=int, default=0, help="Counter current")
 
 
@@ -151,6 +155,8 @@ def main_test(path,args,file_name,use_RRC=None,cuda_num=None):
     env_params['max_RRC_range'] = args.RRC_range
     env_params['use_rtdl_sampling'] = bool(args.use_rtdl_sampling) if hasattr(args, 'use_rtdl_sampling') else False
     env_params['rtdl_sampling_window'] = args.rtdl_sampling_window if hasattr(args, 'rtdl_sampling_window') else 2
+    env_params['rtdl_sampling_temperature'] = args.rtdl_sampling_temperature if hasattr(args, 'rtdl_sampling_temperature') else 1.0
+    env_params['rtdl_sampling_log_every'] = args.rtdl_sampling_log_every if hasattr(args, 'rtdl_sampling_log_every') else 50
 
     create_logger(**logger_params)
 
@@ -206,6 +212,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='test')
     add_common_args(parser)
     args = parser.parse_args()
+    if args.rtdl_sampling_temperature <= 0:
+        raise ValueError("--rtdl_sampling_temperature must be > 0")
 
     cuda_num = 0
     problem_scales = [0]

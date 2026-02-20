@@ -10,6 +10,10 @@ import sys
 import json
 import csv
 import random
+import shutil
+import subprocess
+import tempfile
+from datetime import datetime
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "..")  # for problem_def
@@ -72,6 +76,159 @@ def generate_torus_points(n_points, seed=None):
     return coords
 
 
+def generate_torus_points_mirrored_polylines(
+    n_points,
+    seed=None,
+    n_knots=8,
+    noise_std=0.02,
+    endpoint_margin=0.05,
+    endpoint_min_gap=0.0,
+    min_separation=0.0,
+    max_resample_attempts=50,
+    return_metadata=False
+):
+    """
+    Generate points near two left-to-right polylines with swapped endpoints.
+
+    Curve 1: (0, y0) -> (1, y1)
+    Curve 2: (0, y1) -> (1, y0)
+
+    Under torus left-right wrapping, these two curves connect into one loop.
+    """
+    if n_points <= 0:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    if n_knots < 2:
+        raise ValueError("n_knots must be >= 2")
+
+    rng = np.random.default_rng(seed)
+    endpoint_margin = float(np.clip(endpoint_margin, 0.0, 0.49))
+    endpoint_min_gap = max(0.0, float(endpoint_min_gap))
+    min_separation = max(0.0, float(min_separation))
+    noise_std = max(0.0, float(noise_std))
+    max_possible_gap = max(0.0, 1.0 - 2.0 * endpoint_margin)
+    if endpoint_min_gap > max_possible_gap + 1e-12:
+        raise ValueError(
+            f"endpoint_min_gap={endpoint_min_gap} is infeasible for "
+            f"endpoint_margin={endpoint_margin}. Maximum possible gap is {max_possible_gap}."
+        )
+
+    # Shared x-knots ensure both curves are monotone left-to-right.
+    x_knots = np.linspace(0.0, 1.0, n_knots, dtype=np.float32)
+    curve1_y = None
+    curve2_y = None
+    y0, y1 = None, None
+    y_a, y_b = None, None
+    for _ in range(max_resample_attempts):
+        y0_try = float(rng.uniform(endpoint_margin, 1.0 - endpoint_margin))
+        y1_try = float(rng.uniform(endpoint_margin, 1.0 - endpoint_margin))
+        if abs(y0_try - y1_try) < endpoint_min_gap:
+            continue
+
+        y_a = rng.random(n_knots).astype(np.float32)
+        y_b = rng.random(n_knots).astype(np.float32)
+        y_a[0], y_a[-1] = y0_try, y1_try
+        y_b[0], y_b[-1] = y1_try, y0_try
+
+        if min_separation <= 0.0:
+            y0, y1 = y0_try, y1_try
+            curve1_y, curve2_y = y_a, y_b
+            break
+
+        mid_a = float(np.interp(0.5, x_knots, y_a))
+        mid_b = float(np.interp(0.5, x_knots, y_b))
+        if abs(mid_a - mid_b) >= min_separation:
+            y0, y1 = y0_try, y1_try
+            curve1_y, curve2_y = y_a, y_b
+            break
+
+    if curve1_y is None or curve2_y is None:
+        # Fall back to the latest sampled pair if constraints are too strict.
+        if y_a is None or y_b is None:
+            y_a = rng.random(n_knots).astype(np.float32)
+            y_b = rng.random(n_knots).astype(np.float32)
+        if y0 is None or y1 is None:
+            for _ in range(max_resample_attempts):
+                y0_try = float(rng.uniform(endpoint_margin, 1.0 - endpoint_margin))
+                y1_try = float(rng.uniform(endpoint_margin, 1.0 - endpoint_margin))
+                if abs(y0_try - y1_try) >= endpoint_min_gap:
+                    y0, y1 = y0_try, y1_try
+                    break
+            if y0 is None or y1 is None:
+                # Should not happen due feasibility check above, but keep a safe fallback.
+                y0 = float(endpoint_margin)
+                y1 = float(1.0 - endpoint_margin)
+        curve1_y, curve2_y = y_a, y_b
+        curve1_y[0], curve1_y[-1] = y0, y1
+        curve2_y[0], curve2_y[-1] = y1, y0
+
+    curve1_knots = np.column_stack([x_knots, curve1_y]).astype(np.float32)
+    curve2_knots = np.column_stack([x_knots, curve2_y]).astype(np.float32)
+
+    def _sample_near_polyline(knots, count):
+        if count <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        p0 = knots[:-1]
+        p1 = knots[1:]
+        seg_vec = p1 - p0
+        seg_len = np.linalg.norm(seg_vec, axis=1)
+        total_len = float(seg_len.sum())
+
+        if total_len <= 1e-12:
+            # Degenerate polyline fallback.
+            out = np.repeat(knots[:1], count, axis=0)
+            return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+        probs = seg_len / total_len
+        seg_ids = rng.choice(len(seg_len), size=count, p=probs)
+        t = rng.random(count).astype(np.float32)
+
+        base = p0[seg_ids] + seg_vec[seg_ids] * t[:, None]
+        tangents = seg_vec[seg_ids]
+        tan_norm = np.linalg.norm(tangents, axis=1, keepdims=True)
+        tan_norm = np.maximum(tan_norm, 1e-12)
+        tangents_unit = tangents / tan_norm
+
+        normals = np.stack([-tangents_unit[:, 1], tangents_unit[:, 0]], axis=1)
+        offsets = normals * rng.normal(0.0, noise_std, size=(count, 1))
+        points = base + offsets
+        points = np.clip(points, 0.0, 1.0)
+        return points.astype(np.float32)
+
+    n1 = n_points // 2
+    n2 = n_points - n1
+    coords_a = _sample_near_polyline(curve1_knots, n1)
+    coords_b = _sample_near_polyline(curve2_knots, n2)
+    coords = np.concatenate([coords_a, coords_b], axis=0)
+    rng.shuffle(coords)
+    coords = coords.astype(np.float32)
+
+    if not return_metadata:
+        return coords
+
+    # Endpoints that define the mirrored construction:
+    # Curve 1: (0, y0) -> (1, y1)
+    # Curve 2: (0, y1) -> (1, y0)
+    generation_metadata = {
+        "layout": "mirrored_polylines",
+        "seed": seed,
+        "n_knots": int(n_knots),
+        "noise_std": float(noise_std),
+        "endpoint_margin": float(endpoint_margin),
+        "endpoint_min_gap": float(endpoint_min_gap),
+        "min_separation": float(min_separation),
+        "actual_endpoint_gap": float(abs(y0 - y1)),
+        "curve1_start": [0.0, float(y0)],
+        "curve1_end": [1.0, float(y1)],
+        "curve2_start": [0.0, float(y1)],
+        "curve2_end": [1.0, float(y0)],
+        "curve1_knots": curve1_knots.tolist(),
+        "curve2_knots": curve2_knots.tolist(),
+    }
+    return coords, generation_metadata
+
+
 def torus_distance(p1, p2):
     """
     Compute distance between two points on unit torus [0,1] x [0,1].
@@ -120,6 +277,100 @@ def compute_torus_distance_matrix(coords):
             dist_matrix[j, i] = dist
     
     return dist_matrix
+
+
+def solve_tsp_with_concorde(
+    dist_matrix,
+    instance_name,
+    concorde_cmd='concorde',
+    scale=1000000,
+    timeout_sec=300
+):
+    """
+    Solve TSP optimally with Concorde using EXPLICIT FULL_MATRIX TSPLIB input.
+
+    Args:
+        dist_matrix: numpy array [n, n], float distances
+        instance_name: Name used for temporary files
+        concorde_cmd: Concorde executable path/name
+        scale: Float->int scaling for TSPLIB edge weights
+        timeout_sec: subprocess timeout
+
+    Returns:
+        (optimal_cost_float, tour_list_of_node_indices)
+    """
+    dist_matrix = np.asarray(dist_matrix, dtype=np.float64)
+    n = dist_matrix.shape[0]
+    if dist_matrix.shape != (n, n):
+        raise ValueError("dist_matrix must be a square matrix")
+
+    cmd_head = str(concorde_cmd).split()[0]
+    if shutil.which(cmd_head) is None and not os.path.exists(cmd_head):
+        raise FileNotFoundError(f"Concorde executable not found: {concorde_cmd}")
+
+    scale = int(scale)
+    if scale <= 0:
+        raise ValueError("scale must be positive")
+
+    mat_int = np.rint(dist_matrix * scale).astype(np.int64)
+    np.fill_diagonal(mat_int, 0)
+
+    with tempfile.TemporaryDirectory(prefix='concorde_torus_') as tmp_dir:
+        base_name = f'{instance_name}_concorde'
+        tsp_path = os.path.join(tmp_dir, f'{base_name}.tsp')
+        sol_path = os.path.join(tmp_dir, f'{base_name}.sol')
+
+        with open(tsp_path, 'w') as f:
+            f.write(f"NAME : {base_name}\n")
+            f.write("TYPE : TSP\n")
+            f.write("COMMENT : Torus distance matrix (EXPLICIT FULL_MATRIX)\n")
+            f.write(f"DIMENSION : {n}\n")
+            f.write("EDGE_WEIGHT_TYPE : EXPLICIT\n")
+            f.write("EDGE_WEIGHT_FORMAT : FULL_MATRIX\n")
+            f.write("EDGE_WEIGHT_SECTION\n")
+            for row in mat_int:
+                f.write(" ".join(map(str, row.tolist())) + "\n")
+            f.write("EOF\n")
+
+        cmd = str(concorde_cmd).split() + [tsp_path]
+        completed = subprocess.run(
+            cmd,
+            cwd=tmp_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"Concorde failed (code={completed.returncode}). "
+                f"stdout={completed.stdout[-800:]}, stderr={completed.stderr[-800:]}"
+            )
+
+        if not os.path.exists(sol_path):
+            raise FileNotFoundError(f"Concorde did not produce .sol file: {sol_path}")
+
+        tokens = []
+        with open(sol_path, 'r') as f:
+            for line in f:
+                tokens.extend(line.strip().split())
+        vals = [int(tok) for tok in tokens if tok.strip()]
+        if len(vals) < n:
+            raise ValueError(f"Invalid .sol file content, expected at least {n} indices, got {len(vals)}")
+
+        if vals[0] == n and len(vals) >= n + 1:
+            tour = vals[1:n + 1]
+        else:
+            tour = vals[:n]
+
+        if sorted(tour) != list(range(n)):
+            raise ValueError("Parsed Concorde tour is not a valid permutation")
+
+        tour_np = np.asarray(tour, dtype=np.int64)
+        shifted = np.roll(tour_np, -1)
+        optimal_cost = float(dist_matrix[tour_np, shifted].sum())
+        return optimal_cost, tour
 
 
 def compute_tour_length_torus(coords, tour):
@@ -223,14 +474,23 @@ def load_torus_instance(instance_path):
     return np.array(coords, dtype=np.float32)
 
 
-def create_tsplib_format_file_torus(coords, output_path, instance_name):
+def create_tsplib_format_file_torus(
+    coords,
+    output_path,
+    instance_name,
+    optimal_cost_method='mst',
+    concorde_cmd='concorde',
+    concorde_scale=1000000,
+    concorde_timeout_sec=300,
+):
     """
     Create a file in the format expected by make_tsplib_data.
     Format: instance_name,optimal_cost,x1,y1,x2,y2,...
     
-    Since we don't know the optimal cost for torus instances, we use an approximation:
-    - Compute MST (Minimum Spanning Tree) length as lower bound
-    - Use MST length as optimal_cost (this prevents division by zero)
+    optimal_cost_method:
+    - 'concorde': use Concorde on explicit torus distance matrix
+    - 'mst': use MST lower bound
+    - 'auto': try Concorde, fallback to MST
     
     Args:
         coords: numpy array of shape (n_points, 2)
@@ -240,28 +500,37 @@ def create_tsplib_format_file_torus(coords, output_path, instance_name):
     Returns:
         Number of nodes
     """
-    # Compute approximate optimal cost using MST as lower bound
-    # This prevents division by zero in gap calculation
     n = len(coords)
-    
-    if SCIPY_AVAILABLE:
-        # Compute distance matrix using torus metric
-        dist_matrix = compute_torus_distance_matrix(coords)
-        
-        # minimum_spanning_tree expects a square distance matrix
-        # Compute MST (this gives us a lower bound for TSP)
-        mst = minimum_spanning_tree(dist_matrix)
-        mst_length = mst.sum()
-        
-        # Use MST length as optimal_cost (lower bound for TSP)
-        # This ensures gap calculation won't divide by zero
-        optimal_cost = float(mst_length)
+    dist_matrix = compute_torus_distance_matrix(coords)
+    method_used = optimal_cost_method
+    optimal_tour = None
+
+    def _mst_lower_bound(matrix):
+        if SCIPY_AVAILABLE:
+            mst = minimum_spanning_tree(matrix)
+            return float(mst.sum())
+        # Conservative fallback if scipy is unavailable
+        return max(1.0, np.sqrt(n) * 0.5)
+
+    if optimal_cost_method in ('concorde', 'auto'):
+        try:
+            optimal_cost, optimal_tour = solve_tsp_with_concorde(
+                dist_matrix=dist_matrix,
+                instance_name=instance_name,
+                concorde_cmd=concorde_cmd,
+                scale=concorde_scale,
+                timeout_sec=concorde_timeout_sec,
+            )
+            method_used = 'concorde'
+        except Exception as e:
+            if optimal_cost_method == 'concorde':
+                raise
+            method_used = 'mst'
+            print(f"[WARN] Concorde failed for {instance_name}, fallback to MST LB: {e}")
+            optimal_cost = _mst_lower_bound(dist_matrix)
     else:
-        # Fallback: use a simple approximation based on problem size
-        # For unit torus with n points, a rough lower bound is sqrt(n) * 0.5
-        # This is a conservative estimate that prevents division by zero
-        # Note: This won't give meaningful gap values, but prevents crash
-        optimal_cost = max(1.0, np.sqrt(n) * 0.5)
+        method_used = 'mst'
+        optimal_cost = _mst_lower_bound(dist_matrix)
     
     # Flatten coordinates
     coords_flat = coords.flatten().tolist()
@@ -271,8 +540,49 @@ def create_tsplib_format_file_torus(coords, output_path, instance_name):
     
     with open(output_path, 'w') as f:
         f.write(line + '\n')
-    
+
+    if method_used == 'concorde':
+        print(f"[INFO] {instance_name}: optimal_cost by Concorde = {optimal_cost:.6f}")
+    else:
+        print(f"[INFO] {instance_name}: reference_cost by MST lower bound = {optimal_cost:.6f}")
+
+    if optimal_tour is not None:
+        tour_path = output_path.replace('_formatted.txt', '_concorde_tour.json')
+        with open(tour_path, 'w') as f:
+            json.dump({
+                'instance_name': instance_name,
+                'optimal_cost': float(optimal_cost),
+                'method': method_used,
+                'tour': optimal_tour,
+            }, f, indent=2)
+
     return coords.shape[0]
+
+
+def save_run_config(args, result_folder, problem_sizes):
+    """
+    Save run configuration to result folder for reproducibility.
+
+    Args:
+        args: Parsed argparse namespace
+        result_folder: Active result folder path
+        problem_sizes: Parsed list of problem sizes
+    """
+    config_path = os.path.join(result_folder, 'run_config.json')
+    config = {
+        'created_at': datetime.now().isoformat(),
+        'cwd': os.getcwd(),
+        'python': sys.version,
+        'conda_env': os.environ.get('CONDA_DEFAULT_ENV'),
+        'argv': sys.argv,
+        'problem_sizes_parsed': problem_sizes,
+        'args': vars(args),
+    }
+
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+
+    print(f"Run config saved to: {config_path}")
 
 
 class TorusTester(Tester):
@@ -345,7 +655,9 @@ def test_single_torus_instance(instance_info, model_load_path, args, result_fold
         'random_insertion': args.random_insertion if hasattr(args, 'random_insertion') else False,
         'use_torus_metric': True,  # Enable torus metric for torus instances
         'use_rtdl_sampling': bool(args.use_rtdl_sampling) if hasattr(args, 'use_rtdl_sampling') else False,
-        'rtdl_sampling_window': args.rtdl_sampling_window if hasattr(args, 'rtdl_sampling_window') else 2
+        'rtdl_sampling_window': args.rtdl_sampling_window if hasattr(args, 'rtdl_sampling_window') else 2,
+        'rtdl_sampling_temperature': args.rtdl_sampling_temperature if hasattr(args, 'rtdl_sampling_temperature') else 1.0,
+        'rtdl_sampling_log_every': args.rtdl_sampling_log_every if hasattr(args, 'rtdl_sampling_log_every') else 50,
     }
     
     model_params = {
@@ -371,6 +683,8 @@ def test_single_torus_instance(instance_info, model_load_path, args, result_fold
         'cuda_device_num': args.cuda_device_num if hasattr(args, 'cuda_device_num') else CUDA_DEVICE_NUM,
         'test_episodes': 1,
         'test_batch_size': 1,
+        'instance_metadata': instance_info.get('generation_metadata'),
+        'instance_id': instance_name,
         'model_load': {
             'path': model_load_path,
         }
@@ -462,17 +776,63 @@ def main():
     parser.add_argument("--with_RTDL", type=int, default=0, help="Use RTDL features (1=True, 0=False)")
     parser.add_argument("--use_rtdl_sampling", type=int, default=0, help="Use RTDL-based vertex sampling for RRC (1=True, 0=False)")
     parser.add_argument("--rtdl_sampling_window", type=int, default=4, help="Number of edges left/right to consider for RTDL sampling")
+    parser.add_argument("--rtdl_sampling_temperature", type=float, default=1.0, help="Softmax temperature for RTDL-based vertex sampling (>0)")
+    parser.add_argument("--rtdl_sampling_log_every", type=int, default=50, help="Log RTDL sampling diagnostics every N calls (<=0 disables periodic logs, first 3 still logged)")
     parser.add_argument("--model_path", type=str, default=model_load_path, help="Path to model checkpoint")
     parser.add_argument("--model_name", type=str, required=True, help="Model name for saving results")
-    parser.add_argument("--problem_sizes", type=str, default="100,200,300,500", help="Comma-separated list of problem sizes")
+    parser.add_argument("--problem_sizes", type=str, default="100,300,500", help="Comma-separated list of problem sizes")
     parser.add_argument("--num_instances", type=int, default=20, help="Number of instances per problem size")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for generation")
     parser.add_argument("--instances_dir", type=str, default=None, help="Directory with existing instances (if reusing)")
+    parser.add_argument(
+        "--torus_layout",
+        type=str,
+        default="random",
+        choices=["random", "mirrored_polylines"],
+        help="Point layout for generated torus instances"
+    )
+    parser.add_argument("--polyline_knots", type=int, default=8, help="Number of knots per mirrored polyline")
+    parser.add_argument("--polyline_noise_std", type=float, default=0.02, help="Noise std around mirrored polylines")
+    parser.add_argument("--polyline_endpoint_margin", type=float, default=0.05, help="Endpoint y margin from borders")
+    parser.add_argument(
+        "--polyline_endpoint_min_gap",
+        type=float,
+        default=0.2,
+        help="Minimum absolute gap |y1-y2| between mirrored polyline endpoints"
+    )
+    parser.add_argument("--polyline_min_separation", type=float, default=0.0, help="Minimum y-separation near x=0.5")
+    parser.add_argument(
+        "--optimal_cost_method",
+        type=str,
+        default="concorde",
+        choices=["auto", "concorde", "mst"],
+        help="How to compute reference optimal_cost written to *_formatted.txt"
+    )
+    parser.add_argument(
+        "--concorde_cmd",
+        type=str,
+        default="concorde",
+        help="Concorde executable (name or full path)"
+    )
+    parser.add_argument(
+        "--concorde_scale",
+        type=int,
+        default=1000000,
+        help="Scale factor for float distances -> integer TSPLIB weights"
+    )
+    parser.add_argument(
+        "--concorde_timeout_sec",
+        type=int,
+        default=300,
+        help="Timeout for one Concorde solve in seconds"
+    )
     
     args = parser.parse_args()
     
     # Parse problem sizes
     problem_sizes = [int(x.strip()) for x in args.problem_sizes.split(',')]
+    if args.rtdl_sampling_temperature <= 0:
+        raise ValueError("--rtdl_sampling_temperature must be > 0")
     
     # Determine RTDL status for folder naming
     use_rtdl = bool(args.with_RTDL)
@@ -490,6 +850,7 @@ def main():
     }
     create_logger(**main_logger_params)
     result_folder = get_result_folder()
+    save_run_config(args, result_folder, problem_sizes)
     
     print(f"Testing Torus TSP instances...")
     print(f"Model: {args.model_path}")
@@ -497,6 +858,8 @@ def main():
     print(f"RTDL: {'Enabled' if use_rtdl else 'Disabled'}")
     print(f"Problem sizes: {problem_sizes}")
     print(f"Instances per size: {args.num_instances}")
+    print(f"Torus layout: {args.torus_layout}")
+    print(f"Optimal cost method: {args.optimal_cost_method}")
     print(f"Results will be saved to: {result_folder}")
     
     # Generate or load instances
@@ -514,11 +877,20 @@ def main():
                     coords = load_torus_instance(tsp_path)
                     tsplib_path = os.path.join(result_folder, 'instances', f"{instance_name}_formatted.txt")
                     os.makedirs(os.path.dirname(tsplib_path), exist_ok=True)
-                    create_tsplib_format_file_torus(coords, tsplib_path, instance_name)
+                    create_tsplib_format_file_torus(
+                        coords,
+                        tsplib_path,
+                        instance_name,
+                        optimal_cost_method=args.optimal_cost_method,
+                        concorde_cmd=args.concorde_cmd,
+                        concorde_scale=args.concorde_scale,
+                        concorde_timeout_sec=args.concorde_timeout_sec,
+                    )
                     all_instances.append({
                         'name': instance_name,
                         'coords': coords,
-                        'tsplib_path': tsplib_path
+                        'tsplib_path': tsplib_path,
+                        'generation_metadata': None,
                     })
     else:
         # Generate new instances
@@ -535,19 +907,44 @@ def main():
                 seed = base_seed + instance_counter if args.seed is not None else None
                 
                 # Generate points
-                coords = generate_torus_points(size, seed=seed)
+                if args.torus_layout == "mirrored_polylines":
+                    coords, generation_metadata = generate_torus_points_mirrored_polylines(
+                        size,
+                        seed=seed,
+                        n_knots=args.polyline_knots,
+                        noise_std=args.polyline_noise_std,
+                        endpoint_margin=args.polyline_endpoint_margin,
+                        endpoint_min_gap=args.polyline_endpoint_min_gap,
+                        min_separation=args.polyline_min_separation,
+                        return_metadata=True,
+                    )
+                else:
+                    coords = generate_torus_points(size, seed=seed)
+                    generation_metadata = {
+                        "layout": "random",
+                        "seed": seed,
+                    }
                 
                 # Save instance
                 save_torus_instance(coords, instance_name, result_folder)
                 
                 # Create formatted file for TSPEnv
                 tsplib_path = os.path.join(result_folder, 'instances', f"{instance_name}_formatted.txt")
-                create_tsplib_format_file_torus(coords, tsplib_path, instance_name)
+                create_tsplib_format_file_torus(
+                    coords,
+                    tsplib_path,
+                    instance_name,
+                    optimal_cost_method=args.optimal_cost_method,
+                    concorde_cmd=args.concorde_cmd,
+                    concorde_scale=args.concorde_scale,
+                    concorde_timeout_sec=args.concorde_timeout_sec,
+                )
                 
                 all_instances.append({
                     'name': instance_name,
                     'coords': coords,
-                    'tsplib_path': tsplib_path
+                    'tsplib_path': tsplib_path,
+                    'generation_metadata': generation_metadata,
                 })
                 
                 instance_counter += 1
