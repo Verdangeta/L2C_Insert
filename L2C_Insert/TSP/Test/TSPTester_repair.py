@@ -12,7 +12,7 @@ except ImportError:
     Circle = None
     MATPLOTLIB_AVAILABLE = False
 
-from L2C_Insert.TSP.Test.TSPModel import TSPModel as Model
+from L2C_Insert.TSP.Test.TSPModel import TSPModel as Model, torus_distance_tensor
 from L2C_Insert.TSP.Test.TSPEnv import TSPEnv as Env
 from L2C_Insert.TSP.utils.utils import *
 from L2C_Insert.TSP.utils.kruskal_tsp_rtdl import kruskal_tsp, kruskal_tsp_rtdl
@@ -261,12 +261,15 @@ class TSPTester():
             stu_len = float(student_np[idx]) if idx < len(student_np) else float('nan')
             opt_len = float(optimal_np[idx]) if idx < len(optimal_np) else float('nan')
             gap_pct = ((stu_len - opt_len) / opt_len * 100.0) if opt_len != 0 else float('nan')
-            concorde_text = ""
-            if concorde_cost is not None:
-                concorde_text = f", concorde_opt={concorde_cost:.4f}"
+
+            # Short flag в заголовке: есть ли advanced_sampling (RTDL sampling).
+            adv_flag = ""
+            if self.env_params.get('use_rtdl_sampling', False):
+                adv_flag = " | adv_sampling"
+
             ax.set_title(
-                f'Final tour: {instance_name} | N={coords.shape[0]} | '
-                f'stu={stu_len:.4f}, ref={opt_len:.4f}, gap={gap_pct:.3f}%{concorde_text}'
+                f'Final tour: {instance_name} | N={coords.shape[0]}{adv_flag} | '
+                f'stu={stu_len:.4f}, ref={opt_len:.4f}, gap={gap_pct:.3f}%'
             )
             ax.set_xlim(0.0, 1.0)
             ax.set_ylim(0.0, 1.0)
@@ -469,9 +472,10 @@ class TSPTester():
     def sampling_subpaths_by_RTDL(self, problems, solution, length_sub):
         """
         Sample subpath using RTDL weights to select vertex for destruction.
-        For each vertex in the tour, compute a score based on sum of RTDL weights
-        of neighboring edges (window edges to left and right in the tour).
-        Sample vertex with probability proportional to this score.
+        Two scoring modes are supported via env param `rtdl_sampling_window`:
+        - window mode (window > 0): score by summing RTDL edge weights in tour window
+        - cluster mode (window == 0): score by summing RTDL tour edges incident to
+          k-nearest-node cluster (k=length_sub) around each candidate center node
         """
         problems_size = problems.shape[1]
         batch_size = problems.shape[0]
@@ -493,26 +497,57 @@ class TSPTester():
             rtdl_weights = torch.roll(rtdl_weights, shifts=mm, dims=1)
             
             # Get window size for neighboring edges
-            window = self.env_params.get('rtdl_sampling_window', 2)
+            window = int(self.env_params.get('rtdl_sampling_window', 2))
             n = problems_size
-            
-            # Compute score for each vertex position in the tour
-            # Score = sum of RTDL weights of edges in the neighborhood of vertex
-            # For vertex at position i in the tour:
-            # - rtdl_weights[b, j] = weight for edge (solution[b, j], solution[b, (j+1) % n])
-            # - For vertex at position i, we sum RTDL weights of edges with indices:
-            #   (i-window) % n, (i-window+1) % n, ..., (i-1) % n, i, (i+1) % n, ..., (i+window-1) % n
-            # - This includes: window edges before vertex i and window edges after vertex i
-            # - Total: 2*window edges in the neighborhood
             device = rtdl_weights.device
+            sampling_mode = "cluster" if window == 0 else "window"
             vertex_scores = torch.zeros(n, dtype=torch.float32, device=device)
-            
-            for i in range(n):
-                # Sum RTDL weights of edges within window around vertex i
-                # j ranges from -window to window-1, giving us 2*window edges
-                for j in range(-window, window):
-                    edge_idx = (i + j) % n
-                    vertex_scores[i] += rtdl_weights[0, edge_idx]
+
+            if sampling_mode == "window":
+                # Score = sum of RTDL edge weights in the tour-index neighborhood.
+                # For vertex at position i, sum edges [(i-window) ... (i+window-1)] on cycle.
+                for i in range(n):
+                    for j in range(-window, window):
+                        edge_idx = (i + j) % n
+                        vertex_scores[i] += rtdl_weights[0, edge_idx]
+            else:
+                # Cluster mode:
+                # for each candidate center, take k nearest nodes in geometry space
+                # (k=length_sub), then score by RTDL sum of tour edges incident to cluster.
+                use_torus_metric = self.model_params.get('use_torus_metric', False)
+                if torch.is_tensor(length_sub):
+                    cluster_k = int(length_sub.item())
+                else:
+                    cluster_k = int(length_sub)
+                cluster_k = max(1, min(cluster_k, n))
+
+                coords = problems[0]
+                if use_torus_metric:
+                    p1 = coords.unsqueeze(1).expand(n, n, 2)
+                    p2 = coords.unsqueeze(0).expand(n, n, 2)
+                    pairwise_distance = torus_distance_tensor(p1, p2)
+                else:
+                    pairwise_distance = torch.cdist(coords, coords, p=2)
+
+                # nearest_nodes[v] are node ids of the cluster around node v.
+                nearest_nodes = torch.argsort(pairwise_distance, dim=1)[:, :cluster_k]
+
+                # Build edge endpoints for current rolled tour.
+                tour_nodes = solution[0].long()
+                pos = torch.arange(n, device=device)
+                next_pos = (pos + 1) % n
+                edge_u = tour_nodes
+                edge_v = tour_nodes[next_pos]
+
+                # Score each candidate position in tour (equivalent to candidate node).
+                for i in range(n):
+                    center_node = int(tour_nodes[i].item())
+                    cluster_nodes = nearest_nodes[center_node].long()
+                    in_cluster = torch.zeros(n, dtype=torch.bool, device=device)
+                    in_cluster[cluster_nodes] = True
+
+                    removed_mask = in_cluster[edge_u] | in_cluster[edge_v]
+                    vertex_scores[i] = rtdl_weights[0, removed_mask].sum()
             
             # Convert scores to probabilities with temperature-scaled softmax.
             # Lower temperature -> sharper distribution; higher temperature -> flatter.
@@ -546,15 +581,19 @@ class TSPTester():
                     top_nodes = solution[0, top_pos]
                     # Entropy is a compact indicator of distribution sharpness.
                     entropy = -(probs * torch.log(probs + 1e-12)).sum().item()
+                    extra_mode_info = f"window={window}"
+                    if sampling_mode == "cluster":
+                        extra_mode_info = f"cluster_k={cluster_k}"
                     self.logger.info(
-                        "[RTDL sampling] step=%d temp=%.4f window=%d "
+                        "[RTDL sampling] step=%d mode=%s temp=%.4f %s "
                         "score[min/mean/max]=[%.6f/%.6f/%.6f] "
                         "prob[min/max]=[%.6f/%.6f] entropy=%.6f "
                         "selected=(pos:%d,node:%d,p:%.6f) "
                         "top%d=%s",
                         self._rtdl_sampling_log_counter,
+                        sampling_mode,
                         temperature,
-                        window,
+                        extra_mode_info,
                         vertex_scores.min().item(),
                         vertex_scores.mean().item(),
                         vertex_scores.max().item(),

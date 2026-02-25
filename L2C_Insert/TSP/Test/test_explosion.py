@@ -350,7 +350,7 @@ def solve_tsp_with_concorde(
         return optimal_cost, tour
 
 
-def save_explosion_instance(coords, instance_name, result_folder):
+def save_explosion_instance(coords, instance_name, result_folder, generation_metadata=None):
     """
     Save explosion instance in TSPLIB format.
     
@@ -358,6 +358,7 @@ def save_explosion_instance(coords, instance_name, result_folder):
         coords: numpy array of shape (n_points, 2)
         instance_name: Name of the instance
         result_folder: Folder to save the instance
+        generation_metadata: Optional dict with generation metadata (for visualization)
     """
     instances_dir = os.path.join(result_folder, 'instances')
     os.makedirs(instances_dir, exist_ok=True)
@@ -382,6 +383,44 @@ def save_explosion_instance(coords, instance_name, result_folder):
         
         f.write("EOF\n")
     
+    # Save metadata if provided
+    if generation_metadata is not None:
+        metadata_path = os.path.join(instances_dir, f"{instance_name}_metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(generation_metadata, f, indent=2)
+    
+    return tsp_path
+
+
+def save_explosion_instance_to_dir(coords, instance_name, instances_dir, generation_metadata=None):
+    """
+    Save explosion instance in TSPLIB format directly into instances_dir.
+    """
+    os.makedirs(instances_dir, exist_ok=True)
+
+    tsp_path = os.path.join(instances_dir, f"{instance_name}.tsp")
+    n_points = len(coords)
+
+    with open(tsp_path, 'w') as f:
+        f.write(f"NAME : {instance_name}\n")
+        f.write(f"COMMENT : Explosion TSP instance with {n_points} cities\n")
+        f.write("TYPE : TSP\n")
+        f.write(f"DIMENSION : {n_points}\n")
+        f.write("EDGE_WEIGHT_TYPE : EUC_2D\n")
+        f.write("NODE_COORD_SECTION\n")
+
+        for i, (x, y) in enumerate(coords, 1):
+            x_int = int(x * 1000000)
+            y_int = int(y * 1000000)
+            f.write(f"{i} {x_int} {y_int}\n")
+
+        f.write("EOF\n")
+
+    if generation_metadata is not None:
+        metadata_path = os.path.join(instances_dir, f"{instance_name}_metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(generation_metadata, f, indent=2)
+
     return tsp_path
 
 
@@ -426,6 +465,79 @@ def load_explosion_instance(instance_path):
         raise ValueError(f"No coordinates found in {instance_path}")
     
     return np.array(coords, dtype=np.float32)
+
+
+def load_explosion_metadata(instance_path):
+    """
+    Load explosion generation metadata from JSON file if it exists.
+    
+    Args:
+        instance_path: Path to .tsp file
+        
+    Returns:
+        Dict with generation metadata or None if file doesn't exist
+    """
+    metadata_path = instance_path.replace('.tsp', '_metadata.json')
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Warning: Failed to load metadata from {metadata_path}: {e}")
+    return None
+
+
+def create_default_explosion_metadata(args, coords):
+    """
+    Create default explosion metadata from command line arguments.
+    Used when loading instances without saved metadata.
+    
+    Args:
+        args: Command line arguments
+        coords: numpy array of shape (n_points, 2)
+        
+    Returns:
+        Dict with generation metadata
+    """
+    if args.layout != 'explosion':
+        return None
+    
+    # Create a simple default explosion region in the center
+    # This is a fallback - ideally metadata should be saved with instances
+    n_points = len(coords)
+    avg_range = (args.range_min + args.range_max) / 2.0
+    
+    explosion_regions = []
+    for i in range(args.num_centers):
+        # Distribute centers evenly if multiple
+        if args.num_centers > 1:
+            angle = 2 * np.pi * i / args.num_centers
+            radius_offset = 0.2
+            center = [
+                0.5 + radius_offset * np.cos(angle),
+                0.5 + radius_offset * np.sin(angle)
+            ]
+        else:
+            center = [0.5, 0.5]  # Center of unit board
+        explosion_regions.append({
+            "center": center,
+            "radius": float(avg_range),
+        })
+    
+    metadata = {
+        "layout": args.layout,
+        "seed": None,  # Unknown when loading
+        "range_min": float(args.range_min),
+        "range_max": float(args.range_max),
+        "rate": float(args.rate) if args.layout == "explosion" else None,
+        "num_centers": int(args.num_centers),
+        "explosion_regions": explosion_regions,
+        "normalization": {
+            "min_coords": [0.0, 0.0],  # Assumed normalized
+            "max_coords": [1.0, 1.0],
+        },
+    }
+    return metadata
 
 
 def create_tsplib_format_file_explosion(
@@ -491,6 +603,10 @@ def create_tsplib_format_file_explosion(
     # Create line in expected format
     line = f"{instance_name},{optimal_cost}," + ",".join(map(str, coords_flat))
     
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     with open(output_path, 'w') as f:
         f.write(line + '\n')
 
@@ -536,6 +652,39 @@ def save_run_config(args, result_folder, problem_sizes):
         json.dump(config, f, indent=2)
 
     print(f"Run config saved to: {config_path}")
+
+
+def _float_tag(x):
+    return str(float(x)).replace('.', 'p').replace('-', 'm')
+
+
+def build_instances_pool_name(args, problem_sizes):
+    sizes_tag = f"{min(problem_sizes)}-{max(problem_sizes)}" if len(problem_sizes) > 1 else str(problem_sizes[0])
+    seed_tag = "none" if args.seed is None else str(args.seed)
+    base = (
+        f"{args.layout}_c{args.num_centers}_n{args.num_instances}_s{sizes_tag}_"
+        f"r{_float_tag(args.range_min)}-{_float_tag(args.range_max)}_seed{seed_tag}"
+    )
+    if args.layout == "explosion":
+        base += f"_rate{_float_tag(args.rate)}"
+    return base
+
+
+def save_instances_pool_config(instances_dir, args, problem_sizes):
+    pool_cfg = {
+        'created_at': datetime.now().isoformat(),
+        'problem_sizes': problem_sizes,
+        'num_instances': int(args.num_instances),
+        'layout': str(args.layout),
+        'num_centers': int(args.num_centers),
+        'range_min': float(args.range_min),
+        'range_max': float(args.range_max),
+        'rate': float(args.rate),
+        'seed': args.seed,
+        'pool_name': args.instances_pool_name,
+    }
+    with open(os.path.join(instances_dir, 'instances_pool_config.json'), 'w') as f:
+        json.dump(pool_cfg, f, indent=2)
 
 
 def test_single_explosion_instance(instance_info, model_load_path, args, result_folder):
@@ -678,7 +827,7 @@ def main():
     parser = argparse.ArgumentParser(description='Test Explosion/Implosion TSP instances')
     parser.add_argument("--cuda_device_num", type=int, default=0, help="CUDA device number")
     parser.add_argument("--RRC_budget", type=int, default=1000, help="RRC budget")
-    parser.add_argument("--RRC_range", type=int, default=200, help="RRC range")
+    parser.add_argument("--RRC_range", type=int, default=50, help="RRC range")
     parser.add_argument("--random_insertion", type=int, default=0, help="Random insertion")
     parser.add_argument("--knearest", type=int, default=1, help="Use k-nearest")
     parser.add_argument("--k_nearest_edges", type=int, default=100, help="K nearest edges")
@@ -686,7 +835,15 @@ def main():
     parser.add_argument("--coor_norm", type=int, default=0, help="Coordinate normalization")
     parser.add_argument("--with_RTDL", type=int, default=0, help="Use RTDL features (1=True, 0=False)")
     parser.add_argument("--use_rtdl_sampling", type=int, default=0, help="Use RTDL-based vertex sampling for RRC (1=True, 0=False)")
-    parser.add_argument("--rtdl_sampling_window", type=int, default=4, help="Number of edges left/right to consider for RTDL sampling")
+    parser.add_argument(
+        "--rtdl_sampling_window",
+        type=int,
+        default=5,
+        help=(
+            "RTDL vertex scoring mode: >0 uses tour-window scoring (sum of left/right edge weights), "
+            "0 uses cluster scoring (sum over k-nearest-neighbor edge weights, k=length_sub)"
+        ),
+    )
     parser.add_argument("--rtdl_sampling_temperature", type=float, default=0.4, help="Softmax temperature for RTDL-based vertex sampling (>0)")
     parser.add_argument("--rtdl_sampling_log_every", type=int, default=50, help="Log RTDL sampling diagnostics every N calls (<=0 disables periodic logs, first 3 still logged)")
     parser.add_argument("--model_path", type=str, default=model_load_path, help="Path to model checkpoint")
@@ -695,6 +852,27 @@ def main():
     parser.add_argument("--num_instances", type=int, default=15, help="Number of instances per problem size")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for generation")
     parser.add_argument("--instances_dir", type=str, default=None, help="Directory with existing instances (if reusing)")
+    parser.add_argument(
+        "--instances_pool_root",
+        type=str,
+        default=None,
+        help=(
+            "Root directory for shared instance pools. "
+            "If set (and --instances_dir is not set), instances are reused from a parameterized pool folder."
+        ),
+    )
+    parser.add_argument(
+        "--instances_pool_name",
+        type=str,
+        default=None,
+        help="Optional explicit pool folder name under --instances_pool_root.",
+    )
+    parser.add_argument(
+        "--regenerate_instances",
+        type=int,
+        default=0,
+        help="Regenerate instances in the shared pool (1=True, 0=False).",
+    )
     parser.add_argument("--skip_baselines", type=int, default=1, help="Skip Kruskal-TSP baselines (1=skip, 0=run). L2C does not use them.")
     parser.add_argument(
         "--optimal_cost_method",
@@ -745,6 +923,8 @@ def main():
     problem_sizes = [int(x.strip()) for x in args.problem_sizes.split(',')]
     if args.rtdl_sampling_temperature <= 0:
         raise ValueError("--rtdl_sampling_temperature must be > 0")
+    if args.rtdl_sampling_window < 0:
+        raise ValueError("--rtdl_sampling_window must be >= 0 (0=cluster mode, >0=window mode)")
     if args.num_centers < 1:
         raise ValueError("--num_centers must be >= 1")
     
@@ -785,19 +965,55 @@ def main():
     print(f"Optimal cost method: {args.optimal_cost_method}")
     print(f"Results will be saved to: {result_folder}")
     
+    # Resolve shared instances pool (optional)
+    pool_instances_dir = None
+    if args.instances_pool_root and not args.instances_dir:
+        pool_name = args.instances_pool_name or build_instances_pool_name(args, problem_sizes)
+        pool_instances_dir = os.path.join(args.instances_pool_root, pool_name)
+        os.makedirs(pool_instances_dir, exist_ok=True)
+        args.instances_pool_name = pool_name
+        print(f"Using shared instance pool: {pool_instances_dir}")
+
     # Generate or load instances
     all_instances = []
-    
-    if args.instances_dir:
+    source_instances_dir = args.instances_dir or pool_instances_dir
+    use_existing_instances = False
+
+    if source_instances_dir and not bool(args.regenerate_instances):
+        expected_total = len(problem_sizes) * args.num_instances
+        existing_count = 0
+        for size in problem_sizes:
+            for i in range(args.num_instances):
+                instance_name = f"{args.layout}_{size}_{i:03d}"
+                tsp_path = os.path.join(source_instances_dir, f"{instance_name}.tsp")
+                if os.path.exists(tsp_path):
+                    existing_count += 1
+        use_existing_instances = (existing_count == expected_total)
+        if not use_existing_instances:
+            print(
+                f"Shared instances incomplete in {source_instances_dir}: "
+                f"{existing_count}/{expected_total}. Instances will be regenerated."
+            )
+
+    if source_instances_dir and use_existing_instances:
         # Load existing instances
-        print(f"Loading instances from {args.instances_dir}...")
-        instances_dir = args.instances_dir
+        print(f"Loading instances from {source_instances_dir}...")
+        instances_dir = source_instances_dir
         for size in problem_sizes:
             for i in range(args.num_instances):
                 instance_name = f"{args.layout}_{size}_{i:03d}"
                 tsp_path = os.path.join(instances_dir, f"{instance_name}.tsp")
                 if os.path.exists(tsp_path):
                     coords = load_explosion_instance(tsp_path)
+                    
+                    # Try to load saved metadata, fallback to default if not found
+                    generation_metadata = load_explosion_metadata(tsp_path)
+                    if generation_metadata is None:
+                        # Create default metadata from command line arguments
+                        generation_metadata = create_default_explosion_metadata(args, coords)
+                        if generation_metadata:
+                            print(f"Note: Using default explosion metadata for {instance_name} (metadata file not found)")
+                    
                     tsplib_path = os.path.join(result_folder, 'instances', f"{instance_name}_formatted.txt")
                     os.makedirs(os.path.dirname(tsplib_path), exist_ok=True)
                     reference_metadata = create_tsplib_format_file_explosion(
@@ -813,14 +1029,19 @@ def main():
                         'name': instance_name,
                         'coords': coords,
                         'tsplib_path': tsplib_path,
-                        'generation_metadata': None,
+                        'generation_metadata': generation_metadata,
                         'reference_metadata': reference_metadata,
                     })
     else:
         # Generate new instances
-        print("Generating new instances...")
-        instances_dir = os.path.join(result_folder, 'instances')
-        os.makedirs(instances_dir, exist_ok=True)
+        if source_instances_dir:
+            print(f"Generating new instances into shared pool: {source_instances_dir}...")
+            instances_dir = source_instances_dir
+            os.makedirs(instances_dir, exist_ok=True)
+        else:
+            print("Generating new instances...")
+            instances_dir = os.path.join(result_folder, 'instances')
+            os.makedirs(instances_dir, exist_ok=True)
         
         base_seed = args.seed if args.seed is not None else 42
         instance_counter = 0
@@ -860,8 +1081,11 @@ def main():
                 if args.layout == "explosion":
                     generation_metadata.update(explosion_meta)
                 
-                # Save instance
-                save_explosion_instance(coords, instance_name, result_folder)
+                # Save instance with metadata
+                if source_instances_dir:
+                    save_explosion_instance_to_dir(coords, instance_name, instances_dir, generation_metadata)
+                else:
+                    save_explosion_instance(coords, instance_name, result_folder, generation_metadata)
                 
                 # Create formatted file for TSPEnv
                 tsplib_path = os.path.join(result_folder, 'instances', f"{instance_name}_formatted.txt")
@@ -884,6 +1108,9 @@ def main():
                 })
                 
                 instance_counter += 1
+
+        if source_instances_dir:
+            save_instances_pool_config(source_instances_dir, args, problem_sizes)
     
     print(f"Total instances to test: {len(all_instances)}")
     
