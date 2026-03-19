@@ -25,7 +25,7 @@ import logging
 import numpy as np
 import torch
 from torch.distributions import Exponential
-from L2C_Insert.TSP.utils.utils import create_logger, copy_all_src
+from L2C_Insert.TSP.utils.utils import create_logger, copy_all_src, set_result_folder
 from L2C_Insert.TSP.Test.TSPTester_repair import TSPTester as Tester
 from L2C_Insert.TSP.Test.TSPEnv import TSPEnv
 import argparse
@@ -41,7 +41,7 @@ except ImportError:
 
 ########### Frequent use parameters  ##################################################
 
-model_load_path = '../Train/result/20260114_042024_train/checkpoint-8.pt'
+model_load_path = '/trinity/home/alexander.mironenko/TDA_tsp/L2C_Insert/L2C_Insert/TSP/Test/result/pretrain/tsp_model.pt'
  
 # Default problem sizes and number of instances
 DEFAULT_PROBLEM_SIZES = [100, 200, 300, 500]
@@ -548,6 +548,7 @@ def create_tsplib_format_file_explosion(
     concorde_cmd='concorde',
     concorde_scale=1000000,
     concorde_timeout_sec=300,
+    reference_cache_dir=None,
 ):
     """
     Create a file in the format expected by make_tsplib_data.
@@ -567,9 +568,10 @@ def create_tsplib_format_file_explosion(
         Dict with reference metadata used for evaluation.
     """
     n = len(coords)
-    dist_matrix = compute_euclidean_distance_matrix(coords)
     method_used = optimal_cost_method
     optimal_tour = None
+    optimal_cost = None
+    cache_hit = False
 
     def _mst_lower_bound(matrix):
         if SCIPY_AVAILABLE:
@@ -577,25 +579,70 @@ def create_tsplib_format_file_explosion(
             return float(mst.sum())
         return max(1.0, np.sqrt(n) * 0.5)
 
-    if optimal_cost_method in ('concorde', 'auto'):
+    # Try to reuse cached Concorde solution from shared instances pool.
+    cache_path = None
+    if reference_cache_dir:
+        cache_path = os.path.join(reference_cache_dir, f"{instance_name}_reference.json")
+
+    if cache_path and optimal_cost_method in ('concorde', 'auto') and os.path.exists(cache_path):
         try:
-            optimal_cost, optimal_tour = solve_tsp_with_concorde(
-                dist_matrix=dist_matrix,
-                instance_name=instance_name,
-                concorde_cmd=concorde_cmd,
-                scale=concorde_scale,
-                timeout_sec=concorde_timeout_sec,
-            )
-            method_used = 'concorde'
-        except Exception as e:
+            with open(cache_path, 'r') as f:
+                cached = json.load(f)
+            cached_method = str(cached.get('method', ''))
+            cached_cost = float(cached.get('optimal_cost'))
+            cached_tour = cached.get('tour')
+
+            cache_ok = np.isfinite(cached_cost) and cached_cost > 0
             if optimal_cost_method == 'concorde':
-                raise
+                cache_ok = cache_ok and (cached_method == 'concorde')
+
+            if cache_ok:
+                optimal_cost = cached_cost
+                method_used = cached_method if cached_method else optimal_cost_method
+                if isinstance(cached_tour, list) and len(cached_tour) == n:
+                    optimal_tour = cached_tour
+                cache_hit = True
+                print(f"[INFO] {instance_name}: loaded reference from cache ({method_used})")
+        except Exception as e:
+            print(f"[WARN] Failed to read reference cache for {instance_name}: {e}")
+
+    if optimal_cost is None:
+        dist_matrix = compute_euclidean_distance_matrix(coords)
+        if optimal_cost_method in ('concorde', 'auto'):
+            try:
+                optimal_cost, optimal_tour = solve_tsp_with_concorde(
+                    dist_matrix=dist_matrix,
+                    instance_name=instance_name,
+                    concorde_cmd=concorde_cmd,
+                    scale=concorde_scale,
+                    timeout_sec=concorde_timeout_sec,
+                )
+                method_used = 'concorde'
+            except Exception as e:
+                if optimal_cost_method == 'concorde':
+                    raise
+                method_used = 'mst'
+                print(f"[WARN] Concorde failed for {instance_name}, fallback to MST LB: {e}")
+                optimal_cost = _mst_lower_bound(dist_matrix)
+        else:
             method_used = 'mst'
-            print(f"[WARN] Concorde failed for {instance_name}, fallback to MST LB: {e}")
             optimal_cost = _mst_lower_bound(dist_matrix)
-    else:
-        method_used = 'mst'
-        optimal_cost = _mst_lower_bound(dist_matrix)
+
+        if cache_path and method_used == 'concorde':
+            try:
+                with open(cache_path, 'w') as f:
+                    json.dump({
+                        'instance_name': instance_name,
+                        'optimal_cost': float(optimal_cost),
+                        'method': method_used,
+                        'tour': optimal_tour,
+                        'concorde_cmd': str(concorde_cmd),
+                        'concorde_scale': int(concorde_scale),
+                        'concorde_timeout_sec': int(concorde_timeout_sec),
+                    }, f, indent=2)
+                print(f"[INFO] {instance_name}: saved Concorde reference cache")
+            except Exception as e:
+                print(f"[WARN] Failed to save reference cache for {instance_name}: {e}")
     
     # Flatten coordinates
     coords_flat = coords.flatten().tolist()
@@ -611,7 +658,8 @@ def create_tsplib_format_file_explosion(
         f.write(line + '\n')
 
     if method_used == 'concorde':
-        print(f"[INFO] {instance_name}: optimal_cost by Concorde = {optimal_cost:.6f}")
+        source_text = "cache" if cache_hit else "Concorde"
+        print(f"[INFO] {instance_name}: optimal_cost by {source_text} = {optimal_cost:.6f}")
     else:
         print(f"[INFO] {instance_name}: reference_cost by MST lower bound = {optimal_cost:.6f}")
 
@@ -721,6 +769,13 @@ def test_single_explosion_instance(instance_info, model_load_path, args, result_
         'use_rtdl_sampling': bool(args.use_rtdl_sampling) if hasattr(args, 'use_rtdl_sampling') else False,
         'rtdl_sampling_window': args.rtdl_sampling_window if hasattr(args, 'rtdl_sampling_window') else 2,
         'rtdl_sampling_temperature': args.rtdl_sampling_temperature if hasattr(args, 'rtdl_sampling_temperature') else 1.0,
+        'rtdl_sampling_topk_frac': args.rtdl_sampling_topk_frac if hasattr(args, 'rtdl_sampling_topk_frac') else 0.05,
+        'rtdl_sampling_topk_min': args.rtdl_sampling_topk_min if hasattr(args, 'rtdl_sampling_topk_min') else 20,
+        'rtdl_sampling_cluster_score_reduction': (
+            args.rtdl_sampling_cluster_score_reduction
+            if hasattr(args, 'rtdl_sampling_cluster_score_reduction')
+            else 'sum'
+        ),
         'rtdl_sampling_log_every': args.rtdl_sampling_log_every if hasattr(args, 'rtdl_sampling_log_every') else 50,
         'skip_baselines': bool(args.skip_baselines) if hasattr(args, 'skip_baselines') else False,
     }
@@ -749,6 +804,8 @@ def test_single_explosion_instance(instance_info, model_load_path, args, result_
         'test_batch_size': 1,
         'instance_metadata': instance_info.get('generation_metadata'),
         'instance_id': instance_name,
+        # Общая папка результатов всего запуска test_explosion (для shared логов вроде rrc_logs).
+        'parent_result_folder': result_folder,
         'model_load': {
             'path': model_load_path,
         }
@@ -844,10 +901,50 @@ def main():
             "0 uses cluster scoring (sum over k-nearest-neighbor edge weights, k=length_sub)"
         ),
     )
-    parser.add_argument("--rtdl_sampling_temperature", type=float, default=0.4, help="Softmax temperature for RTDL-based vertex sampling (>0)")
+    parser.add_argument(
+        "--rtdl_sampling_temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "Temperature applied after z-score normalization of RTDL candidate scores. "
+            "If >0, uses softmax sampling inside the current top-k candidate set; "
+            "if <0, switches to greedy (argmax) selection; if == 0, this is invalid."
+        ),
+    )
+    parser.add_argument(
+        "--rtdl_sampling_topk_frac",
+        type=float,
+        default=0.05,
+        help="Top fraction of RTDL-ranked vertices used for softmax sampling (0, 1].",
+    )
+    parser.add_argument(
+        "--rtdl_sampling_topk_min",
+        type=int,
+        default=20,
+        help="Minimum top-k size used for RTDL softmax sampling.",
+    )
+    parser.add_argument(
+        "--rtdl_sampling_cluster_score_reduction",
+        type=str,
+        default="sum",
+        choices=["sum", "mean"],
+        help=(
+            "How to aggregate RTDL edge weights in cluster mode "
+            "(used only when --rtdl_sampling_window 0)."
+        ),
+    )
     parser.add_argument("--rtdl_sampling_log_every", type=int, default=50, help="Log RTDL sampling diagnostics every N calls (<=0 disables periodic logs, first 3 still logged)")
     parser.add_argument("--model_path", type=str, default=model_load_path, help="Path to model checkpoint")
     parser.add_argument("--model_name", type=str, required=True, help="Model name for saving results")
+    parser.add_argument(
+        "--result_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit output directory. "
+            "If set, all run artifacts are saved there instead of timestamp-based folder."
+        ),
+    )
     parser.add_argument("--problem_sizes", type=str, default="100,300,500", help="Comma-separated list of problem sizes")
     parser.add_argument("--num_instances", type=int, default=15, help="Number of instances per problem size")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for generation")
@@ -896,7 +993,7 @@ def main():
     parser.add_argument(
         "--concorde_timeout_sec",
         type=int,
-        default=300,
+        default=360000,
         help="Timeout for one Concorde solve in seconds"
     )
     # Instance generation parameters
@@ -921,10 +1018,16 @@ def main():
     
     # Parse problem sizes
     problem_sizes = [int(x.strip()) for x in args.problem_sizes.split(',')]
-    if args.rtdl_sampling_temperature <= 0:
-        raise ValueError("--rtdl_sampling_temperature must be > 0")
+    if args.rtdl_sampling_temperature == 0:
+        raise ValueError("--rtdl_sampling_temperature must be != 0")
+    if not (0 < args.rtdl_sampling_topk_frac <= 1):
+        raise ValueError("--rtdl_sampling_topk_frac must be in (0, 1]")
+    if args.rtdl_sampling_topk_min < 1:
+        raise ValueError("--rtdl_sampling_topk_min must be >= 1")
     if args.rtdl_sampling_window < 0:
         raise ValueError("--rtdl_sampling_window must be >= 0 (0=cluster mode, >0=window mode)")
+    if args.rtdl_sampling_cluster_score_reduction not in ("sum", "mean"):
+        raise ValueError("--rtdl_sampling_cluster_score_reduction must be one of: sum, mean")
     if args.num_centers < 1:
         raise ValueError("--num_centers must be >= 1")
     
@@ -941,12 +1044,22 @@ def main():
     
     # Create main logger to establish result folder
     from L2C_Insert.TSP.utils.utils import get_result_folder
-    main_logger_params = {
-        'log_file': {
-            'desc': run_desc,
-            'filename': 'log.txt'
+    if args.result_dir:
+        explicit_result_dir = os.path.abspath(args.result_dir)
+        set_result_folder(explicit_result_dir)
+        main_logger_params = {
+            'log_file': {
+                'filepath': explicit_result_dir,
+                'filename': 'log.txt',
+            }
         }
-    }
+    else:
+        main_logger_params = {
+            'log_file': {
+                'desc': run_desc,
+                'filename': 'log.txt'
+            }
+        }
     create_logger(**main_logger_params)
     result_folder = get_result_folder()
     save_run_config(args, result_folder, problem_sizes)
@@ -1024,6 +1137,7 @@ def main():
                         concorde_cmd=args.concorde_cmd,
                         concorde_scale=args.concorde_scale,
                         concorde_timeout_sec=args.concorde_timeout_sec,
+                        reference_cache_dir=source_instances_dir,
                     )
                     all_instances.append({
                         'name': instance_name,
@@ -1097,6 +1211,7 @@ def main():
                     concorde_cmd=args.concorde_cmd,
                     concorde_scale=args.concorde_scale,
                     concorde_timeout_sec=args.concorde_timeout_sec,
+                    reference_cache_dir=source_instances_dir,
                 )
                 
                 all_instances.append({

@@ -1,6 +1,11 @@
 
 from logging import getLogger
 
+import csv
+import json
+import os
+import random
+
 import numpy as np
 import torch
 try:
@@ -16,9 +21,6 @@ from L2C_Insert.TSP.Test.TSPModel import TSPModel as Model, torus_distance_tenso
 from L2C_Insert.TSP.Test.TSPEnv import TSPEnv as Env
 from L2C_Insert.TSP.utils.utils import *
 from L2C_Insert.TSP.utils.kruskal_tsp_rtdl import kruskal_tsp, kruskal_tsp_rtdl
-import random
-import os
-import json
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 class TSPTester():
@@ -35,6 +37,9 @@ class TSPTester():
         # result folder, logger
         self.logger = getLogger(name='trainer')
         self.result_folder = get_result_folder()
+        # Общая папка результатов всего запуска (например, test_explosion),
+        # куда можно складывать shared-логи для последующего анализа.
+        self.parent_result_folder = self.tester_params.get('parent_result_folder', self.result_folder)
 
         seed = 123
         random.seed(seed)
@@ -71,6 +76,56 @@ class TSPTester():
         self.time_estimator_2 =  TimeEstimator()
         # Counter for periodic RTDL sampling diagnostics in logs.
         self._rtdl_sampling_log_counter = 0
+        # Кэш RTDL для текущего лучшего тура (разрушение RRC):
+        # храним только то, что не зависит от текущего length_sub.
+        self._rtdl_full_solution = None
+        self._rtdl_full_edge_weights = None
+        self._rtdl_full_n = None
+        self._rtdl_problem = None
+        self._rtdl_pairwise_order = None
+        # Базовый тур, относительно которого считаем RTDL для разрушения;
+        # обновляется только при принятии улучшения, чтобы не реагировать
+        # на случайные инверсии/циклические сдвиги.
+        self._rtdl_base_solution = None
+
+    def _save_rrc_step_logs(self, step_logs):
+        """
+        Save per-step RRC statistics for current instance into a CSV file
+        under the shared parent result folder (one file per instance).
+        """
+        if not step_logs:
+            return
+
+        base_dir = getattr(self, "parent_result_folder", self.result_folder)
+        log_dir = os.path.join(base_dir, "rrc_logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        raw_instance_id = self.tester_params.get("instance_id", "instance")
+        safe_instance_id = "".join(
+            ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in str(raw_instance_id)
+        )
+        csv_path = os.path.join(log_dir, f"rrc_steps_{safe_instance_id}.csv")
+
+        fieldnames = [
+            "instance_id",
+            "problem_size",
+            "step",
+            "before_length",
+            "after_length",
+            "abs_delta",
+            "rel_delta",
+            "improved",
+        ]
+
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, mode="a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            for row in step_logs:
+                writer.writerow(row)
+
+        self.logger.info(f"Saved RRC step logs to: {csv_path}")
 
     def _save_final_solutions(self, episode, batch_size, best_select_node_list, current_best_length):
         """
@@ -475,32 +530,66 @@ class TSPTester():
         Two scoring modes are supported via env param `rtdl_sampling_window`:
         - window mode (window > 0): score by summing RTDL edge weights in tour window
         - cluster mode (window == 0): score by summing RTDL tour edges incident to
-          k-nearest-node cluster (k=length_sub) around each candidate center node
+          k-nearest-node cluster (k=length_sub) around each candidate center node.
+          Cluster aggregation is controlled by `rtdl_sampling_cluster_score_reduction`
+          and can be either `sum` or `mean`.
         """
         problems_size = problems.shape[1]
         batch_size = problems.shape[0]
         
         try:
-            # Compute RTDL for the full tour
-            rtdl_cache = self.model.compute_rtdl_features(problems, solution)
-            
-            # Extract RTDL weights for all edges in the tour
-            rtdl_weights = self.model.extract_rtdl_weights_for_edges(rtdl_cache, solution)
-            # rtdl_weights shape: [B, num_nodes]
-            # rtdl_weights[b, i] = weight for edge (solution[b, i], solution[b, (i+1) % n])
-            
-            # Randomly roll solution to avoid bias
-            mm = torch.randint(low=4, high=problems_size, size=[1])[0].item()
-            solution = torch.roll(solution, shifts=mm, dims=1)
-            
-            # Also roll RTDL weights to match the rolled solution
-            rtdl_weights = torch.roll(rtdl_weights, shifts=mm, dims=1)
-            
-            # Get window size for neighboring edges
             window = int(self.env_params.get('rtdl_sampling_window', 2))
-            n = problems_size
-            device = rtdl_weights.device
             sampling_mode = "cluster" if window == 0 else "window"
+            temperature = float(self.env_params.get('rtdl_sampling_temperature', 1.0))
+            if temperature == 0:
+                raise ValueError("rtdl_sampling_temperature must be != 0")
+            topk_frac = float(self.env_params.get('rtdl_sampling_topk_frac', 0.05))
+            topk_min = int(self.env_params.get('rtdl_sampling_topk_min', 20))
+            if topk_frac <= 0:
+                raise ValueError("rtdl_sampling_topk_frac must be > 0")
+            if topk_min < 1:
+                raise ValueError("rtdl_sampling_topk_min must be >= 1")
+            cluster_score_reduction = str(
+                self.env_params.get('rtdl_sampling_cluster_score_reduction', 'sum')
+            ).lower()
+            if cluster_score_reduction not in ('sum', 'mean'):
+                raise ValueError(
+                    "rtdl_sampling_cluster_score_reduction must be one of: sum, mean"
+                )
+
+            cluster_k = None
+            if sampling_mode == "cluster":
+                if torch.is_tensor(length_sub):
+                    cluster_k = int(length_sub.item())
+                else:
+                    cluster_k = int(length_sub)
+                cluster_k = max(1, min(cluster_k, problems_size))
+
+            # Переиспользуем только RTDL веса полного тура: они зависят от тура,
+            # но не зависят от текущего length_sub. Сами vertex_scores строим
+            # заново на каждом шаге для текущего масштаба разрушения.
+            use_score_cache = False
+            if (
+                self._rtdl_full_solution is not None
+                and self._rtdl_full_solution.shape == solution.shape
+                and self._rtdl_full_edge_weights is not None
+            ):
+                try:
+                    use_score_cache = bool(torch.equal(self._rtdl_full_solution, solution))
+                except Exception:
+                    use_score_cache = False
+
+            if not use_score_cache:
+                rtdl_cache = self.model.compute_rtdl_features(problems, solution)
+                rtdl_weights = self.model.extract_rtdl_weights_for_edges(rtdl_cache, solution)
+                self._rtdl_full_solution = solution.clone()
+                self._rtdl_full_edge_weights = rtdl_weights
+                self._rtdl_full_n = problems_size
+            else:
+                rtdl_weights = self._rtdl_full_edge_weights
+
+            n = int(self._rtdl_full_n)
+            device = rtdl_weights.device
             vertex_scores = torch.zeros(n, dtype=torch.float32, device=device)
 
             if sampling_mode == "window":
@@ -515,24 +604,31 @@ class TSPTester():
                 # for each candidate center, take k nearest nodes in geometry space
                 # (k=length_sub), then score by RTDL sum of tour edges incident to cluster.
                 use_torus_metric = self.model_params.get('use_torus_metric', False)
-                if torch.is_tensor(length_sub):
-                    cluster_k = int(length_sub.item())
-                else:
-                    cluster_k = int(length_sub)
-                cluster_k = max(1, min(cluster_k, n))
+                reuse_pairwise_order = False
+                if (
+                    self._rtdl_problem is not None
+                    and self._rtdl_problem.shape == problems.shape
+                    and self._rtdl_pairwise_order is not None
+                ):
+                    try:
+                        reuse_pairwise_order = bool(torch.equal(self._rtdl_problem, problems))
+                    except Exception:
+                        reuse_pairwise_order = False
 
-                coords = problems[0]
-                if use_torus_metric:
-                    p1 = coords.unsqueeze(1).expand(n, n, 2)
-                    p2 = coords.unsqueeze(0).expand(n, n, 2)
-                    pairwise_distance = torus_distance_tensor(p1, p2)
-                else:
-                    pairwise_distance = torch.cdist(coords, coords, p=2)
+                if not reuse_pairwise_order:
+                    coords = problems[0]
+                    if use_torus_metric:
+                        p1 = coords.unsqueeze(1).expand(n, n, 2)
+                        p2 = coords.unsqueeze(0).expand(n, n, 2)
+                        pairwise_distance = torus_distance_tensor(p1, p2)
+                    else:
+                        pairwise_distance = torch.cdist(coords, coords, p=2)
+                    self._rtdl_problem = problems.clone()
+                    self._rtdl_pairwise_order = torch.argsort(pairwise_distance, dim=1)
 
-                # nearest_nodes[v] are node ids of the cluster around node v.
-                nearest_nodes = torch.argsort(pairwise_distance, dim=1)[:, :cluster_k]
+                nearest_nodes = self._rtdl_pairwise_order[:, :cluster_k]
 
-                # Build edge endpoints for current rolled tour.
+                # Build edge endpoints for current tour.
                 tour_nodes = solution[0].long()
                 pos = torch.arange(n, device=device)
                 next_pos = (pos + 1) % n
@@ -547,27 +643,39 @@ class TSPTester():
                     in_cluster[cluster_nodes] = True
 
                     removed_mask = in_cluster[edge_u] | in_cluster[edge_v]
-                    vertex_scores[i] = rtdl_weights[0, removed_mask].sum()
-            
-            # Convert scores to probabilities with temperature-scaled softmax.
-            # Lower temperature -> sharper distribution; higher temperature -> flatter.
-            temperature = float(self.env_params.get('rtdl_sampling_temperature', 1.0))
-            if temperature <= 0:
-                raise ValueError(f"rtdl_sampling_temperature must be > 0, got {temperature}")
+                    cluster_edge_weights = rtdl_weights[0, removed_mask]
+                    if cluster_score_reduction == "mean":
+                        vertex_scores[i] = cluster_edge_weights.mean()
+                    else:
+                        vertex_scores[i] = cluster_edge_weights.sum()
 
-            # Subtract max for numerical stability before softmax.
-            scores_scaled = vertex_scores / temperature
-            scores_scaled = scores_scaled - scores_scaled.max()
-            probs = torch.softmax(scores_scaled, dim=0)
-            
-            # Sample vertex position based on probabilities
-            selected_position = torch.multinomial(probs.unsqueeze(0), 1).item()
-            
-            # Get the selected node index
+            candidate_top_k = int(np.ceil(topk_frac * n))
+            candidate_top_k = max(topk_min, candidate_top_k)
+            candidate_top_k = min(n, candidate_top_k)
+
+            top_scores, top_pos = torch.topk(vertex_scores, k=candidate_top_k)
+            selected_rank = 0
+            selected_prob = 1.0
+            if temperature < 0:
+                selected_position = int(top_pos[0].item())
+            else:
+                centered_scores = top_scores - top_scores.mean()
+                score_std = top_scores.std(unbiased=False)
+                if torch.isfinite(score_std) and score_std.item() > 1e-8:
+                    normalized_scores = centered_scores / score_std
+                else:
+                    normalized_scores = torch.zeros_like(top_scores)
+
+                logits = normalized_scores / temperature
+                probs = torch.softmax(logits, dim=0)
+                sampled_idx = int(torch.multinomial(probs, 1).item())
+                selected_rank = sampled_idx
+                selected_prob = float(probs[sampled_idx].item())
+                selected_position = int(top_pos[sampled_idx].item())
+
             selected_node_index = solution[0, selected_position]
 
-            # Optional diagnostics in logs when RTDL sampling is enabled.
-            # Keep logging periodic to avoid flooding when RRC budget is large.
+            # Диагностика RTDL-рейтинга (без вероятностей, только сами веса).
             if self.env_params.get('use_rtdl_sampling', False):
                 self._rtdl_sampling_log_counter += 1
                 log_every = int(self.env_params.get('rtdl_sampling_log_every', 50))
@@ -576,37 +684,36 @@ class TSPTester():
                     (log_every > 0 and self._rtdl_sampling_log_counter % log_every == 0)
                 )
                 if should_log:
-                    top_k = min(3, n)
-                    top_probs, top_pos = torch.topk(probs, k=top_k)
-                    top_nodes = solution[0, top_pos]
-                    # Entropy is a compact indicator of distribution sharpness.
-                    entropy = -(probs * torch.log(probs + 1e-12)).sum().item()
+                    top_display_k = min(3, candidate_top_k)
+                    log_top_scores, log_top_pos = torch.topk(vertex_scores, k=top_display_k)
+                    log_top_nodes = solution[0, log_top_pos]
                     extra_mode_info = f"window={window}"
                     if sampling_mode == "cluster":
-                        extra_mode_info = f"cluster_k={cluster_k}"
+                        extra_mode_info = (
+                            f"cluster_k={cluster_k},reduction={cluster_score_reduction}"
+                        )
                     self.logger.info(
-                        "[RTDL sampling] step=%d mode=%s temp=%.4f %s "
+                        "[RTDL sampled] step=%d mode=%s %s temp=%.6f topk=%d "
                         "score[min/mean/max]=[%.6f/%.6f/%.6f] "
-                        "prob[min/max]=[%.6f/%.6f] entropy=%.6f "
-                        "selected=(pos:%d,node:%d,p:%.6f) "
+                        "selected=(rank:%d,pos:%d,node:%d,score:%.6f,prob:%.6f) "
                         "top%d=%s",
                         self._rtdl_sampling_log_counter,
                         sampling_mode,
-                        temperature,
                         extra_mode_info,
+                        temperature,
+                        candidate_top_k,
                         vertex_scores.min().item(),
                         vertex_scores.mean().item(),
                         vertex_scores.max().item(),
-                        probs.min().item(),
-                        probs.max().item(),
-                        entropy,
+                        selected_rank,
                         selected_position,
                         int(selected_node_index.item()),
-                        probs[selected_position].item(),
-                        top_k,
+                        vertex_scores[selected_position].item(),
+                        selected_prob,
+                        top_display_k,
                         [
-                            (int(top_pos[i].item()), int(top_nodes[i].item()), float(top_probs[i].item()))
-                            for i in range(top_k)
+                            (int(log_top_pos[i].item()), int(log_top_nodes[i].item()), float(log_top_scores[i].item()))
+                            for i in range(top_display_k)
                         ],
                     )
             
@@ -853,6 +960,8 @@ class TSPTester():
 
 
                 best_select_node_list = self.env.abs_partial_solu_2
+            # Инициализируем базовый тур для RTDL-разрушения.
+            self._rtdl_base_solution = best_select_node_list.clone()
             current_best_length = self.env._get_travel_distance_2(self.origin_problem, best_select_node_list)
             escape_time, _ = clock.get_est_string(1, 1)
 
@@ -871,6 +980,9 @@ class TSPTester():
             max_range = min(self.env_params['max_RRC_range'], self.origin_problem_size)
 
             length_fix = torch.randint(low=4, high=max_range, size=[budget])  # in [0,N)
+
+            # Покадровые метрики RRC-дестрой/репейр для текущего инстанса.
+            rrc_step_logs = []
 
             for bbbb in range(budget):
 
@@ -891,8 +1003,13 @@ class TSPTester():
                     else:
                         # Выбор между Proximity и RTDL
                         if self.env_params.get('use_rtdl_sampling', False):
+                            base_solution = (
+                                self._rtdl_base_solution
+                                if self._rtdl_base_solution is not None
+                                else best_select_node_list
+                            )
                             abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_RTDL(
-                                self.origin_problem, best_select_node_list, curren_length_sub)
+                                self.origin_problem, base_solution, curren_length_sub)
                         else:
                             abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_Proximity(
                                 self.origin_problem, best_select_node_list, curren_length_sub)
@@ -901,11 +1018,21 @@ class TSPTester():
                         # Проверка типа стратегии
                         if isinstance(self.env_params['turn_to_cluster_strategy'], str) and \
                            self.env_params['turn_to_cluster_strategy'] == 'rtdl':
+                            base_solution = (
+                                self._rtdl_base_solution
+                                if self._rtdl_base_solution is not None
+                                else best_select_node_list
+                            )
                             abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_RTDL(
-                                self.origin_problem, best_select_node_list, curren_length_sub)
+                                self.origin_problem, base_solution, curren_length_sub)
                         elif self.env_params.get('use_rtdl_sampling', False):
+                            base_solution = (
+                                self._rtdl_base_solution
+                                if self._rtdl_base_solution is not None
+                                else best_select_node_list
+                            )
                             abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_RTDL(
-                                self.origin_problem, best_select_node_list, curren_length_sub)
+                                self.origin_problem, base_solution, curren_length_sub)
                         else:
                             abs_solution, abs_scatter_solu_1, abs_partial_solu_2 = self.sampling_subpaths_by_Proximity(
                                 self.origin_problem, best_select_node_list, curren_length_sub)
@@ -1000,12 +1127,57 @@ class TSPTester():
 
                 after_reward = self.env._get_travel_distance_2(self.origin_problem, self.env.abs_partial_solu_2)
 
+                # Сбор покадровых метрик улучшения/ухудшения решения.
+                try:
+                    before_length = float(before_reward.mean().item())
+                except Exception:
+                    before_length = float("nan")
+                try:
+                    after_length = float(after_reward.mean().item())
+                except Exception:
+                    after_length = float("nan")
+
+                if np.isfinite(before_length) and np.isfinite(after_length):
+                    abs_delta = before_length - after_length
+                    rel_delta = abs_delta / before_length if before_length != 0 else 0.0
+                    improved_flag = 1 if abs_delta > 0 else 0
+
+                    rrc_step_logs.append(
+                        {
+                            "instance_id": str(self.tester_params.get("instance_id", "")),
+                            "problem_size": int(self.origin_problem_size),
+                            "step": int(bbbb),
+                            "before_length": float(before_length),
+                            "after_length": float(after_length),
+                            "abs_delta": float(abs_delta),
+                            "rel_delta": float(rel_delta),
+                            "improved": int(improved_flag),
+                        }
+                    )
+
+                # Сохраняем предыдущее лучшее значение, чтобы отследить факт улучшения.
+                prev_best_mean = float(current_best_length.mean().item())
+
                 best_select_node_list = self.decide_whether_to_repair_solution( best_select_node_list,
                                                                                 before_reward,
                                                                                 self.env.abs_partial_solu_2,
                                                                                 after_reward,
                                                                                     )
                 current_best_length = self.env._get_travel_distance_2(self.origin_problem, best_select_node_list)
+
+                # Если в результате шага тур улучшился, сбрасываем RTDL-кэш
+                # и обновляем базовый тур для RTDL-разрушения.
+                try:
+                    new_best_mean = float(current_best_length.mean().item())
+                except Exception:
+                    new_best_mean = prev_best_mean
+                if new_best_mean < prev_best_mean - 1e-9:
+                    self._rtdl_full_solution = None
+                    self._rtdl_full_edge_weights = None
+                    self._rtdl_full_n = None
+                    self._rtdl_problem = None
+                    self._rtdl_pairwise_order = None
+                    self._rtdl_base_solution = best_select_node_list.clone()
 
                 jjj = torch.arange(batch_size)
 
@@ -1024,6 +1196,9 @@ class TSPTester():
                                    current_best_length.mean() - self.optimal_length.mean()) / self.optimal_length.mean()).item() * 100
                 self.logger.info("RRC step{}, name:{}, gap:{:6f} %, Elapsed[{}], stu_l:{:6f} , opt_l:{:6f}".format(
                     bbbb, name, gap, escape_time, current_best_length.mean().item(), self.optimal_length.mean().item()))
+
+            # Сохранить все шаги RRC для данного инстанса в CSV.
+            self._save_rrc_step_logs(rrc_step_logs)
 
             # best_select_node_list = torch.load('LEHD_RRC_step1000_episode10000.pt')[episode:episode+batch_size]
             # torch.save(best_select_node_list, f'TSP{self.origin_problem_size}_RRC_step{budget}_{episode}_{episode + batch_size}.pt')
