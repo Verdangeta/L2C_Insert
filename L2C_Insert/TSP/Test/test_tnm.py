@@ -169,7 +169,14 @@ def test_single_instance(instance_info, optima_dict, model_load_path, args):
         'max_RRC_range': args.RRC_range if hasattr(args, 'RRC_range') else 200,
         'mix_sample_strategy': mix_sample_strategy,
         'turn_to_cluster_strategy': turn_to_cluster_strategy,
-        'random_insertion': args.random_insertion if hasattr(args, 'random_insertion') else False
+        'random_insertion': args.random_insertion if hasattr(args, 'random_insertion') else False,
+        'use_rtdl_sampling': bool(args.use_rtdl_sampling) if hasattr(args, 'use_rtdl_sampling') else False,
+        'rtdl_sampling_window': args.rtdl_sampling_window if hasattr(args, 'rtdl_sampling_window') else 2,
+        'rtdl_sampling_temperature': args.rtdl_sampling_temperature if hasattr(args, 'rtdl_sampling_temperature') else 1.0,
+        'rtdl_sampling_topk_frac': args.rtdl_sampling_topk_frac if hasattr(args, 'rtdl_sampling_topk_frac') else 0.05,
+        'rtdl_sampling_topk_min': args.rtdl_sampling_topk_min if hasattr(args, 'rtdl_sampling_topk_min') else 20,
+        'rtdl_sampling_cluster_score_reduction': args.rtdl_sampling_cluster_score_reduction if hasattr(args, 'rtdl_sampling_cluster_score_reduction') else "sum",
+        'rtdl_sampling_log_every': args.rtdl_sampling_log_every if hasattr(args, 'rtdl_sampling_log_every') else 50,
     }
     
     model_params = {
@@ -260,21 +267,50 @@ def main():
     parser.add_argument("--k_nearest_scatter", type=int, default=100, help="K nearest scatter")
     parser.add_argument("--coor_norm", type=int, default=0, help="Coordinate normalization")
     parser.add_argument("--with_RTDL", type=int, default=0, help="Use RTDL features (1=True, 0=False)")
+    parser.add_argument("--use_rtdl_sampling", type=int, default=0, help="Use RTDL-based vertex sampling for RRC (1=True, 0=False)")
+    parser.add_argument("--rtdl_sampling_window", type=int, default=4, help="Number of edges left/right to consider for RTDL sampling")
+    parser.add_argument(
+        "--rtdl_sampling_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature applied after z-score normalization of RTDL candidate scores (!=0, <0 means greedy)",
+    )
+    parser.add_argument("--rtdl_sampling_topk_frac", type=float, default=0.05, help="Top fraction of RTDL-ranked vertices used for softmax sampling (0, 1].")
+    parser.add_argument("--rtdl_sampling_topk_min", type=int, default=20, help="Minimum top-k size used for RTDL softmax sampling.")
+    parser.add_argument(
+        "--rtdl_sampling_cluster_score_reduction",
+        type=str,
+        default="sum",
+        choices=["sum", "mean"],
+        help=(
+            "How to aggregate RTDL edge weights in cluster mode "
+            "(used only when --rtdl_sampling_window 0)."
+        ),
+    )
+    parser.add_argument("--rtdl_sampling_log_every", type=int, default=50, help="Log RTDL sampling diagnostics every N calls (<=0 disables periodic logs, first 3 still logged)")
     parser.add_argument("--model_path", type=str, default=model_load_path, help="Path to model checkpoint")
     parser.add_argument("--start_idx", type=int, default=0, help="Start index (for resuming)")
     parser.add_argument("--end_idx", type=int, default=None, help="End index (for testing subset)")
     
     args = parser.parse_args()
+    if args.rtdl_sampling_temperature == 0:
+        raise ValueError("--rtdl_sampling_temperature must be != 0")
+    if not (0 < args.rtdl_sampling_topk_frac <= 1):
+        raise ValueError("--rtdl_sampling_topk_frac must be in (0, 1]")
+    if args.rtdl_sampling_topk_min < 1:
+        raise ValueError("--rtdl_sampling_topk_min must be >= 1")
     
     # Determine RTDL status for folder naming
     use_rtdl = bool(args.with_RTDL) if hasattr(args, 'with_RTDL') else False
+    use_rtdl_sampling = bool(args.use_rtdl_sampling) if hasattr(args, 'use_rtdl_sampling') else False
     rtdl_suffix = '_RTDL' if use_rtdl else '_noRTDL'
+    rtdl_sampling_suffix = '_advance_sampling' if use_rtdl_sampling else ''
     
     # Create main logger to establish result folder
     from L2C_Insert.TSP.utils.utils import get_result_folder
     main_logger_params = {
         'log_file': {
-            'desc': f'test_tnm_all{rtdl_suffix}',
+            'desc': f'test_tnm_all{rtdl_suffix}{rtdl_sampling_suffix}',
             'filename': 'log.txt'
         }
     }
@@ -299,6 +335,7 @@ def main():
     print(f"Testing {len(instances)} Tnm instances...")
     print(f"Model: {args.model_path}")
     print(f"RTDL: {'Enabled' if use_rtdl else 'Disabled'}")
+    print(f"RTDL sampling: {'Enabled' if use_rtdl_sampling else 'Disabled'}")
     print(f"Results will be saved to: {result_folder}")
     
     # Test each instance
