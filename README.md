@@ -2,7 +2,7 @@
 
 ## [NeurIPS 2025] Learning to Insert for Constructive Neural Vehicle Routing Solver
 
-This repository contains the code implementation of paper [Learning to Insert for Constructive Neural Vehicle Routing Solver](https://openreview.net/forum?id=SXr3Dynctm). 
+This repository contains the code implementation of paper [Learning to Insert for Constructive Neural Vehicle Routing Solver](https://openreview.net/forum?id=SXr3Dynctm).
 In this paper, we propose Learning to Construct with Insertion-based Paradigm (L2C-Insert), a novel insertion-based learning framework for constructive NCO.
 ### Dependencies
 ```bash
@@ -41,6 +41,40 @@ CVRP:
     python test_synthetic.py (on the synthetic dataset)
     python test_lib.py (on the cvrplib dataset)
 ```
+
+#### Reproducing explosion-layout RTDL single experiments
+
+Explosion (and related layout) runs use a two-step pipeline: **baseline cache** (Proximity destroy, no RTDL sampling; computed once per fingerprint under `result/baselines/<fingerprint>/`) → **advanced runs** (RTDL sampling variants) with pairwise analysis vs that baseline.
+
+From the repository root, with your conda env activated (e.g. `conda activate TDA_L2C`):
+
+```bash
+cd L2C_Insert/TSP/Test
+```
+
+1. **Build or reuse baseline cache** (safe to re-run; skips if cache exists unless you pass `--regenerate 1` via the shell wrappers):
+
+```bash
+python -u run_layout_experiments.py --config explosion_500_default --baseline-only
+```
+
+2. **Sweep RTDL `single` sampling** (example grid; tune keys/values as needed):
+
+```bash
+python -u run_layout_experiments.py --config explosion_500_default \
+  --sweep "sampling_variant:single topk_frac:0.5,0.8 temperature:1.0,2.0,3.0 cluster_score_reduction:sum,mean"
+```
+
+Equivalent shell entrypoint (same Python orchestrator; supports `--config`, `--regenerate`, and extra args):
+
+```bash
+bash run_layout_pair.sh --config explosion_500_default \
+  --sweep "sampling_variant:single topk_frac:0.5,0.8 temperature:1.0,2.0,3.0 cluster_score_reduction:sum,mean"
+```
+
+**Artifacts:** each sweep writes `result/experiments/sweep_*/manifest.json` and per-run `compare/` outputs; aggregated ranking is in `all_runs_summary_sorted_by_mean_delta_pp.csv` under the sweep directory when present.
+
+**CLI and presets:** see `python test_explosion.py --help` for destroy/repair and RTDL sampling flags, and `run_explosion_experiments.py` (`PRESETS`) for named `--config` presets.
 
 #### Training
 ```bash
