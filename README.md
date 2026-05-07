@@ -62,14 +62,14 @@ python -u run_layout_experiments.py --config explosion_500_default --baseline-on
 
 ```bash
 python -u run_layout_experiments.py --config explosion_500_default \
-  --sweep "sampling_variant:single topk_frac:0.5,0.8 temperature:1.0,2.0,3.0 cluster_score_reduction:sum,mean"
+  --sweep "sampling_variant:single cluster_score_reduction:mean"
 ```
 
 Equivalent shell entrypoint (same Python orchestrator; supports `--config`, `--regenerate`, and extra args):
 
 ```bash
 bash run_layout_pair.sh --config explosion_500_default \
-  --sweep "sampling_variant:single topk_frac:0.5,0.8 temperature:1.0,2.0,3.0 cluster_score_reduction:sum,mean"
+  --sweep "sampling_variant:single cluster_score_reduction:mean"
 ```
 
 **Artifacts:** each sweep writes `result/experiments/sweep_*/manifest.json` and per-run `compare/` outputs; aggregated ranking is in `all_runs_summary_sorted_by_mean_delta_pp.csv` under the sweep directory when present.
