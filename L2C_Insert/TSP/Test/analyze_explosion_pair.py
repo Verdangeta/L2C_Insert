@@ -2,7 +2,7 @@ import argparse
 import csv
 import json
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -474,11 +474,18 @@ def save_gap_comparison_csv(rows: List[Dict[str, str]], out_path: str) -> None:
             writer.writerow(r)
 
 
-def save_stats_txt(stats: Dict[str, Dict[str, float]], out_path: str) -> None:
+def save_stats_txt(
+    stats: Dict[str, Dict[str, float]],
+    out_path: str,
+    context_lines: Optional[List[str]] = None,
+) -> None:
     lines: List[str] = []
     lines.append("=" * 80)
     lines.append("COMPARISON STATISTICS (baseline vs advanced_sampling)")
     lines.append("=" * 80)
+    if context_lines:
+        lines.extend(context_lines)
+        lines.append("-" * 80)
     if not stats:
         lines.append("No overlapping instances between runs.")
     else:
@@ -500,11 +507,18 @@ def save_stats_txt(stats: Dict[str, Dict[str, float]], out_path: str) -> None:
         f.write("\n".join(lines))
 
 
-def save_gap_stats_txt(stats: Dict[str, Dict[str, float]], out_path: str) -> None:
+def save_gap_stats_txt(
+    stats: Dict[str, Dict[str, float]],
+    out_path: str,
+    context_lines: Optional[List[str]] = None,
+) -> None:
     lines: List[str] = []
     lines.append("=" * 100)
     lines.append("GAP TO CONCORDE BY PROBLEM SIZE (lower gap is better)")
     lines.append("=" * 100)
+    if context_lines:
+        lines.extend(context_lines)
+        lines.append("-" * 100)
     if not stats:
         lines.append("No overlapping instances with valid reference_cost.")
     else:
@@ -644,12 +658,32 @@ def main() -> None:
     rrc_stats_txt = os.path.join(out_dir, "rrc_step_stats.txt")
     plots_dir = os.path.join(out_dir, "combined_plots")
 
+    parsed_params = None
+    context_lines: List[str] = []
+    if args.experiment_params_json:
+        try:
+            parsed_params = json.loads(args.experiment_params_json)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid --experiment_params_json: {e}") from e
+        sampling_variant = parsed_params.get("sampling_variant", "N/A")
+        context_lines.append(f"sampling_variant: {sampling_variant}")
+        for key in (
+            "sampling_window",
+            "temperature",
+            "topk_frac",
+            "topk_min",
+            "multi_local_k_min",
+            "multi_local_k_max",
+        ):
+            if key in parsed_params:
+                context_lines.append(f"{key}: {parsed_params[key]}")
+
     save_comparison_csv(rows, comparison_csv)
     stats = aggregate_by_size(rows)
-    save_stats_txt(stats, stats_txt)
+    save_stats_txt(stats, stats_txt, context_lines=context_lines or None)
     save_gap_comparison_csv(gap_rows, gap_comparison_csv)
     gap_stats = aggregate_gap_by_size(gap_rows)
-    save_gap_stats_txt(gap_stats, gap_stats_txt)
+    save_gap_stats_txt(gap_stats, gap_stats_txt, context_lines=context_lines or None)
 
     # RRC step-level statistics, если есть соответствующие логи.
     baseline_rrc_rows = load_rrc_step_logs(args.baseline_dir)
@@ -669,10 +703,7 @@ def main() -> None:
         json.dump(baseline_ref_payload, f, indent=2)
 
     if args.experiment_params_json:
-        try:
-            parsed_params = json.loads(args.experiment_params_json)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid --experiment_params_json: {e}") from e
+        assert parsed_params is not None
         with open(experiment_params_json, "w") as f:
             json.dump(parsed_params, f, indent=2)
 

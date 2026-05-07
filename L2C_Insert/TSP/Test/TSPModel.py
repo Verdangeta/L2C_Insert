@@ -80,7 +80,7 @@ class TSPModel(nn.Module):
 
 
     def forward(self, data, abs_solution, abs_scatter_solu_1, abs_partial_solu_2, random_index,
-                current_step, last_node_index, rtdl_features=None):
+                current_step, last_node_index, rtdl_features=None, forbidden_edges=None):
 
         batch_size_V = data.shape[0]
         problem_size = data.shape[1]
@@ -104,7 +104,15 @@ class TSPModel(nn.Module):
             # Use provided rtdl_features or compute if not provided
             if self.with_RTDL and rtdl_features is None:
                 rtdl_features = self.compute_rtdl_features(data, abs_partial_solu_2)
-            probs = self.decoder(self.encoded_nodes, abs_partial_solu_2, abs_scatter_solu_1_seleted,abs_scatter_solu_1_unseleted, rtdl_features=rtdl_features)
+            probs = self.decoder(
+                self.encoder,
+                self.encoded_nodes,
+                data,
+                abs_partial_solu_2,
+                abs_scatter_solu_1_seleted,
+                abs_scatter_solu_1_unseleted,
+                rtdl_features=rtdl_features,
+            )
 
             # 根据 abs_scatter_solu_1_seleted 这个点，和 abs_partial_solu_2， 生成相应的label
 
@@ -142,7 +150,7 @@ class TSPModel(nn.Module):
             if self.with_RTDL and rtdl_features is None:
                 rtdl_features = self.compute_rtdl_features(data, abs_partial_solu_2)
             probs = self.decoder(self.encoder, self.encoded_nodes, data,
-                                 abs_partial_solu_2, abs_scatter_solu_1_seleted,abs_scatter_solu_1_unseleted, rtdl_features=rtdl_features)
+                                 abs_partial_solu_2, abs_scatter_solu_1_seleted,abs_scatter_solu_1_unseleted, rtdl_features=rtdl_features, forbidden_edges=forbidden_edges)
 
             rela_selected = probs.argmax(dim=1).unsqueeze(1)  # shape: B
 
@@ -412,6 +420,8 @@ class TSP_Decoder(nn.Module):
         self.layers = nn.ModuleList([DecoderLayer(**model_params) for _ in range(encoder_layer_num)])
 
         self.Linear_final = nn.Linear(embedding_dim, 1, bias=True)
+        self._last_forbid_masked_positions = 0
+        self._last_forbid_full_mask_fallbacks = 0
 
     def _get_encoding(self,encoded_nodes, node_index_to_pick):
         batch_size = node_index_to_pick.size(0)
@@ -424,7 +434,53 @@ class TSP_Decoder(nn.Module):
 
         return picked_nodes
 
-    def forward(self, encoder, encoded_nodes, data, abs_partial_solu_2, abs_scatter_solu_1_seleted,abs_scatter_solu_1_unseleted, rtdl_features=None):
+    def _apply_forbidden_edge_mask_to_logits(self, logits, abs_partial_solu_2, abs_scatter_solu_1_seleted, forbidden_edges):
+        """
+        Mask insertion positions that would recreate forbidden (undirected) edges.
+        For insertion after position j, new edges are:
+          (partial[j], u) and (u, partial[(j+1) % m]).
+        """
+        self._last_forbid_masked_positions = 0
+        self._last_forbid_full_mask_fallbacks = 0
+        if forbidden_edges is None:
+            return logits
+
+        batch_size, m = logits.shape
+        if m <= 0:
+            return logits
+        neg_inf = torch.tensor(float("-inf"), device=logits.device, dtype=logits.dtype)
+        out = logits
+
+        for b in range(batch_size):
+            edges_b = forbidden_edges[b] if isinstance(forbidden_edges, list) else forbidden_edges
+            if not edges_b:
+                continue
+            # Normalize to canonical undirected tuple form.
+            edges_norm = {(min(int(u), int(v)), max(int(u), int(v))) for (u, v) in edges_b}
+            u = int(abs_scatter_solu_1_seleted[b, 0].item())
+            partial = abs_partial_solu_2[b]
+            nxt = torch.roll(partial, shifts=-1, dims=0)
+            mask = torch.zeros(m, dtype=torch.bool, device=logits.device)
+            for j in range(m):
+                left_v = int(partial[j].item())
+                right_v = int(nxt[j].item())
+                e_left = (min(u, left_v), max(u, left_v))
+                e_right = (min(u, right_v), max(u, right_v))
+                if (e_left in edges_norm) or (e_right in edges_norm):
+                    mask[j] = True
+
+            masked_count = int(mask.sum().item())
+            if masked_count == 0:
+                continue
+            if masked_count >= m:
+                # Fallback: do not mask this step to keep decoder feasible.
+                self._last_forbid_full_mask_fallbacks += 1
+                continue
+            out[b, mask] = neg_inf
+            self._last_forbid_masked_positions += masked_count
+        return out
+
+    def forward(self, encoder, encoded_nodes, data, abs_partial_solu_2, abs_scatter_solu_1_seleted,abs_scatter_solu_1_unseleted, rtdl_features=None, forbidden_edges=None):
 
 
         knearest = self.model_params['knearest']
@@ -536,7 +592,12 @@ class TSP_Decoder(nn.Module):
 
 
             out = self.Linear_final(out).squeeze(-1)  # shape: [B*(V-1), reminding_nodes_number + 2, embedding_dim ]
-
+            out = self._apply_forbidden_edge_mask_to_logits(
+                out,
+                abs_partial_solu_2,
+                abs_scatter_solu_1_seleted,
+                forbidden_edges,
+            )
             props = F.softmax(out, dim=-1)  # shape: [B, remind_nodes_number]
 
 
@@ -598,7 +659,12 @@ class TSP_Decoder(nn.Module):
             out = out[:, num:]
 
             out = self.Linear_final(out).squeeze(-1)  # shape: [B*(V-1), reminding_nodes_number + 2, embedding_dim ]
-
+            out = self._apply_forbidden_edge_mask_to_logits(
+                out,
+                abs_partial_solu_2,
+                abs_scatter_solu_1_seleted,
+                forbidden_edges,
+            )
             props = F.softmax(out, dim=-1)  # shape: [B, remind_nodes_number]
 
 

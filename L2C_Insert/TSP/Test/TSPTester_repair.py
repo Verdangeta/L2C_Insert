@@ -5,16 +5,18 @@ import csv
 import json
 import os
 import random
+from typing import List
 
 import numpy as np
 import torch
 try:
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Circle
+    from matplotlib.patches import Circle, Ellipse
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     plt = None
     Circle = None
+    Ellipse = None
     MATPLOTLIB_AVAILABLE = False
 
 from L2C_Insert.TSP.Test.TSPModel import TSPModel as Model, torus_distance_tensor
@@ -87,6 +89,9 @@ class TSPTester():
         # обновляется только при принятии улучшения, чтобы не реагировать
         # на случайные инверсии/циклические сдвиги.
         self._rtdl_base_solution = None
+        # Forbidden-edge mask is optional and per destroy/repair step.
+        # Must exist even when RTDL sampling is disabled (baseline/proximity paths).
+        self._current_forbidden_edges = None
 
     def _save_rrc_step_logs(self, step_logs):
         """
@@ -210,11 +215,6 @@ class TSPTester():
             isinstance(instance_metadata, dict) and
             instance_metadata.get('layout') == 'mirrored_polylines'
         )
-        explosion_layout = (
-            isinstance(instance_metadata, dict) and
-            instance_metadata.get('layout') == 'explosion'
-        )
-
         concorde_tour = None
         concorde_cost = None
         if formatted_instance_path:
@@ -239,21 +239,43 @@ class TSPTester():
                 if isinstance(val, (list, tuple)) and len(val) == 2:
                     endpoint_points.append((float(val[0]), float(val[1]), key))
 
-        explosion_regions = []
-        if explosion_layout:
-            regions = instance_metadata.get('explosion_regions', [])
+        overlay_regions = []
+        overlay_region_key = None
+        overlay_prefix = "reg"
+        overlay_key_to_prefix = {
+            "explosion_regions": "exp",
+            "implosion_regions": "imp",
+            "cluster_regions": "clu",
+        }
+        if isinstance(instance_metadata, dict):
+            for candidate_key, candidate_prefix in overlay_key_to_prefix.items():
+                if isinstance(instance_metadata.get(candidate_key), list):
+                    overlay_region_key = candidate_key
+                    overlay_prefix = candidate_prefix
+                    break
+        if overlay_region_key:
+            regions = instance_metadata.get(overlay_region_key, [])
             if isinstance(regions, list):
                 for idx_region, region in enumerate(regions):
                     if not isinstance(region, dict):
                         continue
                     center = region.get('center')
                     radius = region.get('radius')
+                    radius_x = region.get('radius_x')
+                    radius_y = region.get('radius_y')
                     if (
                         isinstance(center, (list, tuple)) and len(center) == 2 and
                         isinstance(radius, (int, float))
                     ):
-                        explosion_regions.append(
-                            (float(center[0]), float(center[1]), float(radius), idx_region)
+                        overlay_regions.append(
+                            (
+                                float(center[0]),
+                                float(center[1]),
+                                float(radius),
+                                float(radius_x) if isinstance(radius_x, (int, float)) else None,
+                                float(radius_y) if isinstance(radius_y, (int, float)) else None,
+                                idx_region,
+                            )
                         )
 
         for idx in range(batch):
@@ -289,23 +311,37 @@ class TSPTester():
                         pkey, (px, py), textcoords='offset points', xytext=(4, 4),
                         fontsize=8, color='tab:green'
                     )
-            if explosion_layout and len(explosion_regions) > 0:
-                for cx, cy, radius, idx_region in explosion_regions:
-                    circle = Circle(
-                        (cx, cy),
-                        radius,
-                        fill=True,
-                        alpha=0.18,
-                        facecolor='tab:orange',
-                        edgecolor='tab:orange',
-                        linestyle='--',
-                        linewidth=1.5,
-                        zorder=1,
-                    )
-                    ax.add_patch(circle)
+            if len(overlay_regions) > 0:
+                for cx, cy, radius, radius_x, radius_y, idx_region in overlay_regions:
+                    if radius_x is not None and radius_y is not None:
+                        shape = Ellipse(
+                            (cx, cy),
+                            width=2.0 * radius_x,
+                            height=2.0 * radius_y,
+                            fill=True,
+                            alpha=0.18,
+                            facecolor='tab:orange',
+                            edgecolor='tab:orange',
+                            linestyle='--',
+                            linewidth=1.5,
+                            zorder=1,
+                        )
+                    else:
+                        shape = Circle(
+                            (cx, cy),
+                            radius,
+                            fill=True,
+                            alpha=0.18,
+                            facecolor='tab:orange',
+                            edgecolor='tab:orange',
+                            linestyle='--',
+                            linewidth=1.5,
+                            zorder=1,
+                        )
+                    ax.add_patch(shape)
                     ax.scatter([cx], [cy], s=90, marker='*', c='tab:orange', zorder=7)
                     ax.annotate(
-                        f'exp{idx_region + 1}',
+                        f'{overlay_prefix}{idx_region + 1}',
                         (cx, cy),
                         textcoords='offset points',
                         xytext=(4, 4),
@@ -323,8 +359,8 @@ class TSPTester():
                 adv_flag = " | adv_sampling"
 
             ax.set_title(
-                f'Final tour: {instance_name} | N={coords.shape[0]}{adv_flag} | '
-                f'stu={stu_len:.4f}, ref={opt_len:.4f}, gap={gap_pct:.3f}%'
+                f'{instance_name} | N={coords.shape[0]}{adv_flag} | '
+                f'stu={stu_len:.2f}, ref={opt_len:.2f}, gap={gap_pct:.3f}%'
             )
             ax.set_xlim(0.0, 1.0)
             ax.set_ylim(0.0, 1.0)
@@ -446,6 +482,8 @@ class TSPTester():
 
         problems_size = problems.shape[1]
         batch_size = problems.shape[0]
+        requested_length_sub = int(length_sub.item()) if torch.is_tensor(length_sub) else int(length_sub)
+        target_length_sub = max(1, min(requested_length_sub, problems_size))
 
         mm = torch.randint(low=4, high=problems_size, size=[1])[0].item()  # in [0,N)
         solution = torch.roll(solution, shifts=mm, dims=1)
@@ -485,9 +523,9 @@ class TSPTester():
         # radius = sorted_distance[0, length_sub - 1]
 
         # 选择 k-nearest 的 index
-        sorted_index = sorted_index[:, :length_sub]
+        sorted_index = sorted_index[:, :target_length_sub]
 
-        tmp_index = torch.arange(batch_size)[:, None].repeat(1, length_sub)
+        tmp_index = torch.arange(batch_size)[:, None].repeat(1, target_length_sub)
         selected_solution_index = solution[tmp_index, sorted_index]
 
         def _get_new_data_v2(data, selected_node_list, prob_size, B_V):
@@ -527,22 +565,32 @@ class TSPTester():
     def sampling_subpaths_by_RTDL(self, problems, solution, length_sub):
         """
         Sample subpath using RTDL weights to select vertex for destruction.
-        Two scoring modes are supported via env param `rtdl_sampling_window`:
-        - window mode (window > 0): score by summing RTDL edge weights in tour window
-        - cluster mode (window == 0): score by summing RTDL tour edges incident to
-          k-nearest-node cluster (k=length_sub) around each candidate center node.
-          Cluster aggregation is controlled by `rtdl_sampling_cluster_score_reduction`
-          and can be either `sum` or `mean`.
+        Geometric cluster mode only: for each candidate center, take k nearest nodes
+        in coordinate space (k=length_sub), then score by RTDL weights on tour edges
+        incident to that cluster. Aggregation is `rtdl_sampling_cluster_score_reduction`
+        (`sum` or `mean`). Legacy tour-index window scoring (former rtdl_sampling_window>0)
+        is removed; env must pass rtdl_sampling_window=0 or omit it.
         """
         problems_size = problems.shape[1]
         batch_size = problems.shape[0]
+        requested_length_sub = int(length_sub.item()) if torch.is_tensor(length_sub) else int(length_sub)
+        target_length_sub = max(1, min(requested_length_sub, problems_size))
         
         try:
-            window = int(self.env_params.get('rtdl_sampling_window', 2))
-            sampling_mode = "cluster" if window == 0 else "window"
+            win_raw = self.env_params.get('rtdl_sampling_window', 0)
+            window = int(win_raw) if win_raw is not None else 0
+            if window != 0:
+                raise ValueError(
+                    "rtdl_sampling_window must be 0 (cluster RTDL only); "
+                    "tour-index window mode is no longer supported."
+                )
+            cluster_k = target_length_sub
             temperature = float(self.env_params.get('rtdl_sampling_temperature', 1.0))
             if temperature == 0:
                 raise ValueError("rtdl_sampling_temperature must be != 0")
+            edge_target_ess_ratio = float(self.env_params.get('rtdl_sampling_edge_target_ess_ratio', -1.0))
+            if edge_target_ess_ratio > 1.0:
+                raise ValueError("rtdl_sampling_edge_target_ess_ratio must be <= 1")
             topk_frac = float(self.env_params.get('rtdl_sampling_topk_frac', 0.05))
             topk_min = int(self.env_params.get('rtdl_sampling_topk_min', 20))
             if topk_frac <= 0:
@@ -556,14 +604,6 @@ class TSPTester():
                 raise ValueError(
                     "rtdl_sampling_cluster_score_reduction must be one of: sum, mean"
                 )
-
-            cluster_k = None
-            if sampling_mode == "cluster":
-                if torch.is_tensor(length_sub):
-                    cluster_k = int(length_sub.item())
-                else:
-                    cluster_k = int(length_sub)
-                cluster_k = max(1, min(cluster_k, problems_size))
 
             # Переиспользуем только RTDL веса полного тура: они зависят от тура,
             # но не зависят от текущего length_sub. Сами vertex_scores строим
@@ -592,88 +632,537 @@ class TSPTester():
             device = rtdl_weights.device
             vertex_scores = torch.zeros(n, dtype=torch.float32, device=device)
 
-            if sampling_mode == "window":
-                # Score = sum of RTDL edge weights in the tour-index neighborhood.
-                # For vertex at position i, sum edges [(i-window) ... (i+window-1)] on cycle.
-                for i in range(n):
-                    for j in range(-window, window):
-                        edge_idx = (i + j) % n
-                        vertex_scores[i] += rtdl_weights[0, edge_idx]
-            else:
-                # Cluster mode:
-                # for each candidate center, take k nearest nodes in geometry space
-                # (k=length_sub), then score by RTDL sum of tour edges incident to cluster.
-                use_torus_metric = self.model_params.get('use_torus_metric', False)
-                reuse_pairwise_order = False
-                if (
-                    self._rtdl_problem is not None
-                    and self._rtdl_problem.shape == problems.shape
-                    and self._rtdl_pairwise_order is not None
-                ):
-                    try:
-                        reuse_pairwise_order = bool(torch.equal(self._rtdl_problem, problems))
-                    except Exception:
-                        reuse_pairwise_order = False
+            use_torus_metric = self.model_params.get('use_torus_metric', False)
+            reuse_pairwise_order = False
+            if (
+                self._rtdl_problem is not None
+                and self._rtdl_problem.shape == problems.shape
+                and self._rtdl_pairwise_order is not None
+            ):
+                try:
+                    reuse_pairwise_order = bool(torch.equal(self._rtdl_problem, problems))
+                except Exception:
+                    reuse_pairwise_order = False
 
-                if not reuse_pairwise_order:
-                    coords = problems[0]
-                    if use_torus_metric:
-                        p1 = coords.unsqueeze(1).expand(n, n, 2)
-                        p2 = coords.unsqueeze(0).expand(n, n, 2)
-                        pairwise_distance = torus_distance_tensor(p1, p2)
-                    else:
-                        pairwise_distance = torch.cdist(coords, coords, p=2)
-                    self._rtdl_problem = problems.clone()
-                    self._rtdl_pairwise_order = torch.argsort(pairwise_distance, dim=1)
+            if not reuse_pairwise_order:
+                coords = problems[0]
+                if use_torus_metric:
+                    p1 = coords.unsqueeze(1).expand(n, n, 2)
+                    p2 = coords.unsqueeze(0).expand(n, n, 2)
+                    pairwise_distance = torus_distance_tensor(p1, p2)
+                else:
+                    pairwise_distance = torch.cdist(coords, coords, p=2)
+                self._rtdl_problem = problems.clone()
+                self._rtdl_pairwise_order = torch.argsort(pairwise_distance, dim=1)
 
-                nearest_nodes = self._rtdl_pairwise_order[:, :cluster_k]
+            nearest_nodes = self._rtdl_pairwise_order[:, :cluster_k]
 
-                # Build edge endpoints for current tour.
-                tour_nodes = solution[0].long()
-                pos = torch.arange(n, device=device)
-                next_pos = (pos + 1) % n
-                edge_u = tour_nodes
-                edge_v = tour_nodes[next_pos]
+            tour_nodes = solution[0].long()
+            pos = torch.arange(n, device=device)
+            next_pos = (pos + 1) % n
+            edge_u = tour_nodes
+            edge_v = tour_nodes[next_pos]
 
-                # Score each candidate position in tour (equivalent to candidate node).
-                for i in range(n):
-                    center_node = int(tour_nodes[i].item())
-                    cluster_nodes = nearest_nodes[center_node].long()
-                    in_cluster = torch.zeros(n, dtype=torch.bool, device=device)
-                    in_cluster[cluster_nodes] = True
+            for i in range(n):
+                center_node = int(tour_nodes[i].item())
+                cluster_nodes = nearest_nodes[center_node].long()
+                in_cluster = torch.zeros(n, dtype=torch.bool, device=device)
+                in_cluster[cluster_nodes] = True
 
-                    removed_mask = in_cluster[edge_u] | in_cluster[edge_v]
-                    cluster_edge_weights = rtdl_weights[0, removed_mask]
-                    if cluster_score_reduction == "mean":
-                        vertex_scores[i] = cluster_edge_weights.mean()
-                    else:
-                        vertex_scores[i] = cluster_edge_weights.sum()
+                removed_mask = in_cluster[edge_u] | in_cluster[edge_v]
+                cluster_edge_weights = rtdl_weights[0, removed_mask]
+                if cluster_score_reduction == "mean":
+                    vertex_scores[i] = cluster_edge_weights.mean()
+                else:
+                    vertex_scores[i] = cluster_edge_weights.sum()
 
             candidate_top_k = int(np.ceil(topk_frac * n))
             candidate_top_k = max(topk_min, candidate_top_k)
             candidate_top_k = min(n, candidate_top_k)
 
             top_scores, top_pos = torch.topk(vertex_scores, k=candidate_top_k)
-            selected_rank = 0
-            selected_prob = 1.0
-            if temperature < 0:
-                selected_position = int(top_pos[0].item())
-            else:
-                centered_scores = top_scores - top_scores.mean()
-                score_std = top_scores.std(unbiased=False)
+            use_multi_center = bool(self.env_params.get('rtdl_sampling_multi_center', False))
+            use_edge_multi = bool(self.env_params.get('rtdl_sampling_edge_multi', False))
+            use_rtdl_edge = bool(self.env_params.get('rtdl_sampling_rtdl_edge', False))
+            forbid_removed_edges = bool(self.env_params.get('rtdl_sampling_forbid_removed_edges', False))
+            edge_selection = str(self.env_params.get('rtdl_sampling_edge_selection', 'softmax')).lower()
+            if edge_selection not in ('softmax', 'greedy'):
+                raise ValueError("rtdl_sampling_edge_selection must be one of: softmax, greedy")
+            if not self.env_params.get('use_rtdl_sampling', False):
+                use_multi_center = False
+                use_edge_multi = False
+                use_rtdl_edge = False
+            if use_rtdl_edge:
+                use_edge_multi = False
+                use_multi_center = False
+            # forbidden edges are per destroy/repair cycle; default: none.
+            self._current_forbidden_edges = None
+
+            # Sort all points by solution order once (reused by single/multi modes).
+            tmp_index1 = torch.arange(batch_size)[:, None].repeat(1, problems_size)
+            problems_sorted_by_solution = problems[tmp_index1, solution]
+            use_torus_metric = self.model_params.get('use_torus_metric', False)
+
+            def _sample_position(scores: torch.Tensor):
+                rank = 0
+                prob = 1.0
+                if temperature < 0:
+                    return int(torch.argmax(scores).item()), rank, prob
+                centered_scores = scores - scores.mean()
+                score_std = scores.std(unbiased=False)
                 if torch.isfinite(score_std) and score_std.item() > 1e-8:
                     normalized_scores = centered_scores / score_std
                 else:
-                    normalized_scores = torch.zeros_like(top_scores)
-
+                    normalized_scores = torch.zeros_like(scores)
                 logits = normalized_scores / temperature
                 probs = torch.softmax(logits, dim=0)
                 sampled_idx = int(torch.multinomial(probs, 1).item())
-                selected_rank = sampled_idx
-                selected_prob = float(probs[sampled_idx].item())
-                selected_position = int(top_pos[sampled_idx].item())
+                rank = sampled_idx
+                prob = float(probs[sampled_idx].item())
+                return int(sampled_idx), rank, prob
 
-            selected_node_index = solution[0, selected_position]
+            def _nearest_positions_for_center(center_node_index: torch.Tensor, k_value: int) -> List[int]:
+                selected_one_node = problems[:, [center_node_index], :]
+                if use_torus_metric:
+                    from L2C_Insert.TSP.Test.TSPModel import torus_distance_tensor
+                    distance = torus_distance_tensor(problems_sorted_by_solution, selected_one_node)
+                else:
+                    distance = torch.norm(problems_sorted_by_solution - selected_one_node, dim=-1)
+                _, sorted_index = torch.sort(distance, dim=1, descending=False)
+                local_k = max(1, min(int(k_value), problems_size))
+                out = sorted_index[0, :local_k].tolist()
+                return [int(x) for x in out]
+
+            def _edge_softmax_with_optional_ess(scores_vec: torch.Tensor, eligible_mask: torch.Tensor):
+                eligible_count = int(eligible_mask.sum().item())
+                if eligible_count <= 0:
+                    return None, None, 0.0, temperature, None
+                if eligible_count == 1:
+                    idx = int(torch.where(eligible_mask)[0][0].item())
+                    return idx, 0, 1.0, temperature, 1.0
+                neg_inf_local = torch.tensor(float("-inf"), device=scores_vec.device, dtype=scores_vec.dtype)
+                centered = scores_vec - scores_vec[eligible_mask].mean()
+                std = scores_vec[eligible_mask].std(unbiased=False)
+                if torch.isfinite(std) and std.item() > 1e-8:
+                    normalized = centered / std
+                else:
+                    normalized = torch.zeros_like(scores_vec)
+                normalized[~eligible_mask] = neg_inf_local
+
+                eff_temp = float(temperature)
+                if edge_target_ess_ratio > 0 and temperature > 0:
+                    target = float(min(max(edge_target_ess_ratio, 1.0 / eligible_count), 1.0))
+                    lo, hi = 1e-3, 100.0
+                    for _ in range(22):
+                        mid = 0.5 * (lo + hi)
+                        logits_mid = normalized / mid
+                        probs_mid = torch.softmax(logits_mid, dim=0)
+                        ess_mid = 1.0 / float(torch.sum(probs_mid * probs_mid).item())
+                        ess_ratio_mid = ess_mid / float(eligible_count)
+                        if ess_ratio_mid < target:
+                            lo = mid
+                        else:
+                            hi = mid
+                    eff_temp = hi
+
+                logits = normalized / eff_temp
+                probs = torch.softmax(logits, dim=0)
+                if not torch.isfinite(probs).all() or float(probs.sum().item()) < 1e-12:
+                    return None, None, 0.0, eff_temp, None
+                j = int(torch.multinomial(probs, 1).item())
+                ess = 1.0 / float(torch.sum(probs * probs).item())
+                ess_ratio = ess / float(eligible_count)
+                return j, j, float(probs[j].item()), eff_temp, ess_ratio
+
+            selected_rank = 0
+            selected_prob = 1.0
+            selected_position = int(top_pos[0].item())
+            edge_temp_used = float(temperature)
+            edge_ess_ratio_used = None
+            selected_positions: List[int] = []
+            selected_from_touches: List[tuple] = []
+            selected_from_edges: List[tuple] = []
+            selected_from_rtdl_edge: List[tuple] = []
+
+            if use_rtdl_edge:
+                edge_scores = rtdl_weights[0].clone()
+                candidate_edge_top_k = int(np.ceil(topk_frac * n))
+                candidate_edge_top_k = max(topk_min, candidate_edge_top_k)
+                candidate_edge_top_k = min(n, candidate_edge_top_k)
+                top_edge_scores, top_edge_pos = torch.topk(edge_scores, k=candidate_edge_top_k)
+
+                neg_inf = torch.tensor(float("-inf"), device=top_edge_scores.device, dtype=top_edge_scores.dtype)
+                selected_set = set()
+                used_edge_slots = set()
+
+                def _sample_edge_slot_rtdl_edge() -> tuple:
+                    eligible_idx = [j for j in range(candidate_edge_top_k) if j not in used_edge_slots]
+                    if not eligible_idx:
+                        return -1, 0, 0.0, float(temperature), None
+                    if edge_selection == 'greedy' or temperature < 0:
+                        best_j = max(eligible_idx, key=lambda j: float(top_edge_scores[j].item()))
+                        return int(best_j), 0, 1.0, float(temperature), None
+                    masked = top_edge_scores.clone()
+                    for j in range(candidate_edge_top_k):
+                        if j in used_edge_slots:
+                            masked[j] = neg_inf
+                    eligible = torch.isfinite(masked)
+                    if not bool(eligible.any().item()):
+                        return -1, 0, 0.0, float(temperature), None
+                    j, rank, prob, eff_temp, ess_ratio = _edge_softmax_with_optional_ess(masked, eligible)
+                    if j is None:
+                        return -1, 0, 0.0, eff_temp, ess_ratio
+                    return j, rank, prob, eff_temp, ess_ratio
+
+                while len(selected_positions) < target_length_sub and len(used_edge_slots) < candidate_edge_top_k:
+                    sampled_idx, sampled_rank, sampled_prob, sampled_temp, sampled_ess_ratio = _sample_edge_slot_rtdl_edge()
+                    if sampled_idx < 0:
+                        break
+                    edge_temp_used = sampled_temp
+                    edge_ess_ratio_used = sampled_ess_ratio
+                    used_edge_slots.add(sampled_idx)
+                    edge_pos = int(top_edge_pos[sampled_idx].item())
+                    edge_u_node = solution[0, edge_pos]
+                    edge_v_pos = (edge_pos + 1) % n
+                    edge_v_node = solution[0, edge_v_pos]
+
+                    pos_u = _nearest_positions_for_center(edge_u_node, problems_size)
+                    pos_v = _nearest_positions_for_center(edge_v_node, problems_size)
+
+                    pre_count = len(selected_positions)
+                    pu, pv = 0, 0
+                    while len(selected_positions) < target_length_sub:
+                        before = len(selected_positions)
+                        while pu < len(pos_u) and pos_u[pu] in selected_set:
+                            pu += 1
+                        if pu < len(pos_u) and len(selected_positions) < target_length_sub:
+                            p = pos_u[pu]
+                            pu += 1
+                            if p not in selected_set:
+                                selected_positions.append(p)
+                                selected_set.add(p)
+                        if len(selected_positions) >= target_length_sub:
+                            break
+                        while pv < len(pos_v) and pos_v[pv] in selected_set:
+                            pv += 1
+                        if pv < len(pos_v) and len(selected_positions) < target_length_sub:
+                            p = pos_v[pv]
+                            pv += 1
+                            if p not in selected_set:
+                                selected_positions.append(p)
+                                selected_set.add(p)
+                        if len(selected_positions) >= target_length_sub:
+                            break
+                        if len(selected_positions) == before:
+                            break
+
+                    new_positions = len(selected_positions) - pre_count
+                    selected_from_rtdl_edge.append(
+                        (
+                            sampled_rank,
+                            edge_pos,
+                            int(edge_u_node.item()),
+                            int(edge_v_node.item()),
+                            0,
+                            sampled_prob,
+                            new_positions,
+                        )
+                    )
+                    if len(selected_from_rtdl_edge) == 1:
+                        selected_rank = sampled_rank
+                        selected_prob = sampled_prob
+                        selected_position = edge_pos
+
+                if len(selected_positions) < target_length_sub:
+                    anchor_pos = None
+                    for j in range(candidate_edge_top_k):
+                        p = int(top_edge_pos[j].item())
+                        if p not in selected_set:
+                            anchor_pos = p
+                            break
+                    if anchor_pos is None:
+                        for j in range(candidate_top_k):
+                            p = int(top_pos[j].item())
+                            if p not in selected_set:
+                                anchor_pos = p
+                                break
+                    if anchor_pos is None:
+                        _, order = torch.sort(vertex_scores, descending=True)
+                        for i in range(n):
+                            p = int(order[i].item())
+                            if p not in selected_set:
+                                anchor_pos = p
+                                break
+                    if anchor_pos is None:
+                        anchor_pos = int(top_pos[0].item())
+                    anchor_node = solution[0, anchor_pos]
+                    anchor_positions = _nearest_positions_for_center(anchor_node, target_length_sub)
+                    for pos_i in anchor_positions:
+                        if pos_i not in selected_set:
+                            selected_positions.append(pos_i)
+                            selected_set.add(pos_i)
+                        if len(selected_positions) >= target_length_sub:
+                            break
+
+                if len(selected_positions) > target_length_sub:
+                    selected_positions = selected_positions[:target_length_sub]
+                if not selected_positions:
+                    selected_positions = [int(top_pos[0].item())]
+
+                selected_position = selected_positions[0]
+                selected_node_index = solution[0, selected_position]
+                selected_solution_index = solution[:, selected_positions]
+            elif use_edge_multi:
+                local_k_min = int(self.env_params.get('rtdl_sampling_multi_local_k_min', 4))
+                local_k_max = int(self.env_params.get('rtdl_sampling_multi_local_k_max', 20))
+                local_k_min = max(1, local_k_min)
+                local_k_max = max(local_k_min, local_k_max)
+
+                edge_scores = rtdl_weights[0].clone()
+                candidate_edge_top_k = int(np.ceil(topk_frac * n))
+                candidate_edge_top_k = max(topk_min, candidate_edge_top_k)
+                candidate_edge_top_k = min(n, candidate_edge_top_k)
+                top_edge_scores, top_edge_pos = torch.topk(edge_scores, k=candidate_edge_top_k)
+
+                neg_inf = torch.tensor(float("-inf"), device=top_edge_scores.device, dtype=top_edge_scores.dtype)
+                selected_set = set()
+                used_edge_slots = set()
+
+                def _sample_edge_slot_from_topk() -> tuple:
+                    """Sample index into top_edge_scores/top_edge_pos without replacement."""
+                    eligible_idx = [j for j in range(candidate_edge_top_k) if j not in used_edge_slots]
+                    if not eligible_idx:
+                        return -1, 0, 0.0, float(temperature), None
+                    if edge_selection == 'greedy' or temperature < 0:
+                        best_j = max(eligible_idx, key=lambda j: float(top_edge_scores[j].item()))
+                        return int(best_j), 0, 1.0, float(temperature), None
+                    masked = top_edge_scores.clone()
+                    for j in range(candidate_edge_top_k):
+                        if j in used_edge_slots:
+                            masked[j] = neg_inf
+                    eligible = torch.isfinite(masked)
+                    if not bool(eligible.any().item()):
+                        return -1, 0, 0.0, float(temperature), None
+                    j, rank, prob, eff_temp, ess_ratio = _edge_softmax_with_optional_ess(masked, eligible)
+                    if j is None:
+                        return -1, 0, 0.0, eff_temp, ess_ratio
+                    return j, rank, prob, eff_temp, ess_ratio
+
+                while len(selected_positions) < target_length_sub and len(used_edge_slots) < candidate_edge_top_k:
+                    sampled_idx, sampled_rank, sampled_prob, sampled_temp, sampled_ess_ratio = _sample_edge_slot_from_topk()
+                    if sampled_idx < 0:
+                        break
+                    edge_temp_used = sampled_temp
+                    edge_ess_ratio_used = sampled_ess_ratio
+                    used_edge_slots.add(sampled_idx)
+                    edge_pos = int(top_edge_pos[sampled_idx].item())
+                    edge_u_node = solution[0, edge_pos]
+                    edge_v_pos = (edge_pos + 1) % n
+                    edge_v_node = solution[0, edge_v_pos]
+
+                    local_k = random.randint(local_k_min, local_k_max)
+                    positions_u = _nearest_positions_for_center(edge_u_node, local_k)
+                    positions_v = _nearest_positions_for_center(edge_v_node, local_k)
+
+                    pre_count = len(selected_positions)
+                    for pos_i in positions_u:
+                        if pos_i not in selected_set:
+                            selected_positions.append(pos_i)
+                            selected_set.add(pos_i)
+                    for pos_i in positions_v:
+                        if pos_i not in selected_set:
+                            selected_positions.append(pos_i)
+                            selected_set.add(pos_i)
+                    post_count = len(selected_positions)
+                    new_positions = post_count - pre_count
+                    selected_from_edges.append(
+                        (
+                            sampled_rank,
+                            edge_pos,
+                            int(edge_u_node.item()),
+                            int(edge_v_node.item()),
+                            local_k,
+                            sampled_prob,
+                            new_positions,
+                        )
+                    )
+                    if len(selected_from_edges) == 1:
+                        selected_rank = sampled_rank
+                        selected_prob = sampled_prob
+                        selected_position = edge_pos
+
+                # Backfill to satisfy exact destroy budget.
+                if len(selected_positions) < target_length_sub:
+                    anchor_pos = None
+                    for j in range(candidate_edge_top_k):
+                        p = int(top_edge_pos[j].item())
+                        if p not in selected_set:
+                            anchor_pos = p
+                            break
+                    if anchor_pos is None:
+                        for j in range(candidate_top_k):
+                            p = int(top_pos[j].item())
+                            if p not in selected_set:
+                                anchor_pos = p
+                                break
+                    if anchor_pos is None:
+                        _, order = torch.sort(vertex_scores, descending=True)
+                        for i in range(n):
+                            p = int(order[i].item())
+                            if p not in selected_set:
+                                anchor_pos = p
+                                break
+                    if anchor_pos is None:
+                        anchor_pos = int(top_pos[0].item())
+                    anchor_node = solution[0, anchor_pos]
+                    anchor_positions = _nearest_positions_for_center(anchor_node, target_length_sub)
+                    for pos_i in anchor_positions:
+                        if pos_i not in selected_set:
+                            selected_positions.append(pos_i)
+                            selected_set.add(pos_i)
+                        if len(selected_positions) >= target_length_sub:
+                            break
+
+                if len(selected_positions) > target_length_sub:
+                    selected_positions = selected_positions[:target_length_sub]
+                if not selected_positions:
+                    selected_positions = [int(top_pos[0].item())]
+
+                if forbid_removed_edges:
+                    forbidden = set()
+                    for _, _, u_node, v_node, _, _, _ in selected_from_edges:
+                        forbidden.add((min(int(u_node), int(v_node)), max(int(u_node), int(v_node))))
+                    self._current_forbidden_edges = [forbidden for _ in range(batch_size)] if forbidden else None
+
+                selected_position = selected_positions[0]
+                selected_node_index = solution[0, selected_position]
+                selected_solution_index = solution[:, selected_positions]
+            elif use_multi_center:
+                local_k_min = int(self.env_params.get('rtdl_sampling_multi_local_k_min', 4))
+                local_k_max = int(self.env_params.get('rtdl_sampling_multi_local_k_max', 20))
+                local_k_min = max(1, local_k_min)
+                local_k_max = max(local_k_min, local_k_max)
+
+                neg_inf = torch.tensor(float("-inf"), device=top_scores.device, dtype=top_scores.dtype)
+                selected_set = set()
+
+                def _mask_centers_already_removed(scores_vec: torch.Tensor) -> torch.Tensor:
+                    """-inf for top-k slots whose tour position is already slated for removal."""
+                    out = scores_vec.clone()
+                    for j in range(candidate_top_k):
+                        if int(top_pos[j].item()) in selected_set:
+                            out[j] = neg_inf
+                    return out
+
+                def _sample_center_from_topk() -> tuple:
+                    """Sample index into top_scores/top_pos; returns (-1,0,0.0) if no eligible center."""
+                    adj = _mask_centers_already_removed(top_scores)
+                    eligible = torch.isfinite(adj)
+                    if not bool(eligible.any().item()):
+                        return -1, 0, 0.0
+                    if temperature < 0:
+                        masked = adj.clone()
+                        masked[~eligible] = neg_inf
+                        j = int(torch.argmax(masked).item())
+                        return j, 0, 1.0
+                    masked = adj.clone()
+                    masked[~eligible] = neg_inf
+                    centered = masked - masked[eligible].mean()
+                    std = masked[eligible].std(unbiased=False)
+                    if torch.isfinite(std) and std.item() > 1e-8:
+                        normalized = centered / std
+                    else:
+                        normalized = torch.zeros_like(masked)
+                    normalized[~eligible] = neg_inf
+                    logits = normalized / temperature
+                    probs = torch.softmax(logits, dim=0)
+                    if not torch.isfinite(probs).all() or float(probs.sum().item()) < 1e-12:
+                        return -1, 0, 0.0
+                    j = int(torch.multinomial(probs, 1).item())
+                    return j, j, float(probs[j].item())
+
+                while (
+                    len(selected_positions) < target_length_sub
+                ):
+                    sampled_idx, sampled_rank, sampled_prob = _sample_center_from_topk()
+                    if sampled_idx < 0:
+                        break
+                    sampled_position = int(top_pos[sampled_idx].item())
+                    sampled_node_index = solution[0, sampled_position]
+
+                    local_k = random.randint(local_k_min, local_k_max)
+                    local_positions = _nearest_positions_for_center(sampled_node_index, local_k)
+
+                    pre_count = len(selected_positions)
+                    for pos_i in local_positions:
+                        if pos_i not in selected_positions:
+                            selected_positions.append(pos_i)
+                            selected_set.add(pos_i)
+                    post_count = len(selected_positions)
+                    selected_from_touches.append(
+                        (
+                            sampled_rank,
+                            sampled_position,
+                            int(sampled_node_index.item()),
+                            local_k,
+                            sampled_prob,
+                            post_count - pre_count,
+                        )
+                    )
+
+                # Backfill to satisfy exact destroy budget.
+                if len(selected_positions) < target_length_sub:
+                    anchor_pos = None
+                    for j in range(candidate_top_k):
+                        p = int(top_pos[j].item())
+                        if p not in selected_set:
+                            anchor_pos = p
+                            break
+                    if anchor_pos is None:
+                        _, order = torch.sort(vertex_scores, descending=True)
+                        for i in range(n):
+                            p = int(order[i].item())
+                            if p not in selected_set:
+                                anchor_pos = p
+                                break
+                    if anchor_pos is None:
+                        anchor_pos = int(top_pos[0].item())
+                    anchor_node = solution[0, anchor_pos]
+                    anchor_positions = _nearest_positions_for_center(anchor_node, target_length_sub)
+                    for pos_i in anchor_positions:
+                        if pos_i not in selected_positions:
+                            selected_positions.append(pos_i)
+                            selected_set.add(pos_i)
+                        if len(selected_positions) >= target_length_sub:
+                            break
+
+                if len(selected_positions) < target_length_sub:
+                    for pos_i in top_pos.tolist():
+                        pos_i = int(pos_i)
+                        if pos_i not in selected_set:
+                            selected_positions.append(pos_i)
+                            selected_set.add(pos_i)
+                        if len(selected_positions) >= target_length_sub:
+                            break
+
+                if len(selected_positions) > target_length_sub:
+                    selected_positions = selected_positions[:target_length_sub]
+
+                if not selected_positions:
+                    selected_positions = [int(top_pos[0].item())]
+
+                selected_position = selected_positions[0]
+                selected_node_index = solution[0, selected_position]
+                selected_solution_index = solution[:, selected_positions]
+            else:
+                sampled_idx, selected_rank, selected_prob = _sample_position(top_scores)
+                selected_position = int(top_pos[sampled_idx].item())
+                selected_node_index = solution[0, selected_position]
+                selected_positions = _nearest_positions_for_center(selected_node_index, target_length_sub)
+                selected_count = len(selected_positions)
+                tmp_index = torch.arange(batch_size)[:, None].repeat(1, selected_count)
+                selected_pos_tensor = torch.tensor(selected_positions, device=solution.device).unsqueeze(0).repeat(batch_size, 1)
+                selected_solution_index = solution[tmp_index, selected_pos_tensor]
 
             # Диагностика RTDL-рейтинга (без вероятностей, только сами веса).
             if self.env_params.get('use_rtdl_sampling', False):
@@ -684,63 +1173,121 @@ class TSPTester():
                     (log_every > 0 and self._rtdl_sampling_log_counter % log_every == 0)
                 )
                 if should_log:
-                    top_display_k = min(3, candidate_top_k)
-                    log_top_scores, log_top_pos = torch.topk(vertex_scores, k=top_display_k)
-                    log_top_nodes = solution[0, log_top_pos]
-                    extra_mode_info = f"window={window}"
-                    if sampling_mode == "cluster":
+                    if use_rtdl_edge:
+                        strategy_tag = "rtdl_edge"
+                    elif use_edge_multi:
+                        strategy_tag = "multi_edge"
+                    elif use_multi_center:
+                        strategy_tag = "multi"
+                    else:
+                        strategy_tag = "single"
+                    coverage = len(set(selected_positions))
+                    overlap = max(0, sum(x[3] for x in selected_from_touches) - coverage) if use_multi_center else 0
+                    if use_edge_multi:
+                        edge_new_total = sum(x[6] for x in selected_from_edges)
+                    elif use_rtdl_edge:
+                        edge_new_total = sum(x[6] for x in selected_from_rtdl_edge)
+                    else:
+                        edge_new_total = 0
+                    edges_log = (
+                        selected_from_edges
+                        if use_edge_multi
+                        else (selected_from_rtdl_edge if use_rtdl_edge else "[]")
+                    )
+                    edge_sel_log = edge_selection if (use_edge_multi or use_rtdl_edge) else "n/a"
+
+                    if use_rtdl_edge or use_edge_multi:
+                        # Primary ranking is by RTDL tour-edge weights, not vertex_scores.
+                        candidate_edge_top_k_log = int(
+                            min(n, max(topk_min, int(np.ceil(topk_frac * n))))
+                        )
+                        edge_w = rtdl_weights[0]
+                        top_display_ke = min(3, candidate_edge_top_k_log)
+                        log_top_edge_w, log_top_edge_pos = torch.topk(edge_w, k=top_display_ke)
+                        tour0 = solution[0]
+                        top_edge_rows = []
+                        for i in range(top_display_ke):
+                            ep = int(log_top_edge_pos[i].item())
+                            u_n = int(tour0[ep].item())
+                            v_n = int(tour0[(ep + 1) % n].item())
+                            top_edge_rows.append(
+                                (ep, u_n, v_n, float(log_top_edge_w[i].item()))
+                            )
+                        w_first_edge = float(edge_w[selected_position].item())
+                        self.logger.info(
+                            "[RTDL sampled] step=%d mode=%s strategy=%s cluster_k=%d temp=%.6f edge_temp=%.6f edge_target_ess=%.6f edge_ess=%.6f "
+                            "edge_topk=%d edge_rtdl_w[min/mean/max]=[%.6f/%.6f/%.6f] "
+                            "selected_edge=(slot_rank:%d,tour_pos:%d,u:%d,v:%d,rtdl_w:%.6f,prob:%.6f) "
+                            "coverage=%d overlap=%d edge_selection=%s edge_new=%d touches=%s edges=%s top%d_edges=%s",
+                            self._rtdl_sampling_log_counter,
+                            "cluster",
+                            strategy_tag,
+                            cluster_k,
+                            temperature,
+                            edge_temp_used,
+                            edge_target_ess_ratio,
+                            (-1.0 if edge_ess_ratio_used is None else float(edge_ess_ratio_used)),
+                            candidate_edge_top_k_log,
+                            edge_w.min().item(),
+                            edge_w.mean().item(),
+                            edge_w.max().item(),
+                            selected_rank,
+                            selected_position,
+                            int(selected_node_index.item()),
+                            int(tour0[(selected_position + 1) % n].item()),
+                            w_first_edge,
+                            selected_prob,
+                            coverage,
+                            overlap,
+                            edge_sel_log,
+                            edge_new_total,
+                            selected_from_touches if use_multi_center else "[]",
+                            edges_log,
+                            top_display_ke,
+                            top_edge_rows,
+                        )
+                    else:
+                        top_display_k = min(3, candidate_top_k)
+                        log_top_scores, log_top_pos = torch.topk(vertex_scores, k=top_display_k)
+                        log_top_nodes = solution[0, log_top_pos]
                         extra_mode_info = (
                             f"cluster_k={cluster_k},reduction={cluster_score_reduction}"
                         )
-                    self.logger.info(
-                        "[RTDL sampled] step=%d mode=%s %s temp=%.6f topk=%d "
-                        "score[min/mean/max]=[%.6f/%.6f/%.6f] "
-                        "selected=(rank:%d,pos:%d,node:%d,score:%.6f,prob:%.6f) "
-                        "top%d=%s",
-                        self._rtdl_sampling_log_counter,
-                        sampling_mode,
-                        extra_mode_info,
-                        temperature,
-                        candidate_top_k,
-                        vertex_scores.min().item(),
-                        vertex_scores.mean().item(),
-                        vertex_scores.max().item(),
-                        selected_rank,
-                        selected_position,
-                        int(selected_node_index.item()),
-                        vertex_scores[selected_position].item(),
-                        selected_prob,
-                        top_display_k,
-                        [
-                            (int(log_top_pos[i].item()), int(log_top_nodes[i].item()), float(log_top_scores[i].item()))
-                            for i in range(top_display_k)
-                        ],
-                    )
-            
-            # Now proceed with proximity-based selection of k nearest neighbors
-            # (same as in sampling_subpaths_by_Proximity)
-            selected_one_node = problems[:, [selected_node_index], :]
-            
-            # Sort all points by solution order
-            tmp_index1 = torch.arange(batch_size)[:, None].repeat(1, problems_size)
-            problems_sorted_by_solution = problems[tmp_index1, solution]
-            
-            # Compute distances to selected node
-            use_torus_metric = self.model_params.get('use_torus_metric', False)
-            if use_torus_metric:
-                from L2C_Insert.TSP.Test.TSPModel import torus_distance_tensor
-                distance = torus_distance_tensor(problems_sorted_by_solution, selected_one_node)
-            else:
-                distance = torch.norm(problems_sorted_by_solution - selected_one_node, dim=-1)
-            
-            # Sort by distance
-            sorted_distance, sorted_index = torch.sort(distance, dim=1, descending=False)
-            
-            # Select k-nearest
-            sorted_index = sorted_index[:, :length_sub]
-            
-            tmp_index = torch.arange(batch_size)[:, None].repeat(1, length_sub)
-            selected_solution_index = solution[tmp_index, sorted_index]
+                        self.logger.info(
+                            "[RTDL sampled] step=%d mode=%s strategy=%s %s temp=%.6f topk=%d "
+                            "vertex_score[min/mean/max]=[%.6f/%.6f/%.6f] "
+                            "selected=(rank:%d,pos:%d,node:%d,vertex_score:%.6f,prob:%.6f) "
+                            "coverage=%d overlap=%d edge_selection=%s edge_new=%d touches=%s edges=%s top%d_vertices=%s",
+                            self._rtdl_sampling_log_counter,
+                            "cluster",
+                            strategy_tag,
+                            extra_mode_info,
+                            temperature,
+                            candidate_top_k,
+                            vertex_scores.min().item(),
+                            vertex_scores.mean().item(),
+                            vertex_scores.max().item(),
+                            selected_rank,
+                            selected_position,
+                            int(selected_node_index.item()),
+                            vertex_scores[selected_position].item(),
+                            selected_prob,
+                            coverage,
+                            overlap,
+                            edge_sel_log,
+                            edge_new_total,
+                            selected_from_touches if use_multi_center else "[]",
+                            edges_log,
+                            top_display_k,
+                            [
+                                (
+                                    int(log_top_pos[i].item()),
+                                    int(log_top_nodes[i].item()),
+                                    float(log_top_scores[i].item()),
+                                )
+                                for i in range(top_display_k)
+                            ],
+                        )
             
             def _get_new_data_v2(data, selected_node_list, prob_size, B_V):
                 new_sulution_ascending, rank = torch.sort(data, dim=-1, descending=False)
@@ -1066,6 +1613,9 @@ class TSPTester():
 
                 # last_node_index = self.env.abs_partial_solu_2[:, [mm]]
                 last_node_index = self.env.abs_partial_solu_2[:, [-1]]
+                current_forbidden_edges = getattr(self, "_current_forbidden_edges", None)
+                forbid_masked_total = 0
+                forbid_fallback_total = 0
                 while not done:
 
                     partial_end_node_coor = self.model.decoder._get_encoding(state.data, last_node_index)
@@ -1118,7 +1668,11 @@ class TSPTester():
                                                                                                     random_index,
                                                                                                     current_step,
                                                                                                     last_node_index,
-                                                                                                    rtdl_features=rtdl_weights)
+                                                                                                    rtdl_features=rtdl_weights,
+                                                                                                    forbidden_edges=current_forbidden_edges)
+                    if current_forbidden_edges:
+                        forbid_masked_total += int(getattr(self.model.decoder, "_last_forbid_masked_positions", 0))
+                        forbid_fallback_total += int(getattr(self.model.decoder, "_last_forbid_full_mask_fallbacks", 0))
                     last_node_index = abs_scatter_solu_1_seleted
                     current_step += 1
 
@@ -1126,6 +1680,15 @@ class TSPTester():
                                                                         mode='test')
 
                 after_reward = self.env._get_travel_distance_2(self.origin_problem, self.env.abs_partial_solu_2)
+                if current_forbidden_edges:
+                    fsz = len(current_forbidden_edges[0]) if len(current_forbidden_edges) > 0 else 0
+                    self.logger.info(
+                        "[RTDL forbid-removed-edges] rrc_step=%d forbidden_edges=%d masked_positions_total=%d full_mask_fallbacks=%d",
+                        bbbb,
+                        fsz,
+                        forbid_masked_total,
+                        forbid_fallback_total,
+                    )
 
                 # Сбор покадровых метрик улучшения/ухудшения решения.
                 try:

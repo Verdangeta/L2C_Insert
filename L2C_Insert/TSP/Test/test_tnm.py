@@ -171,7 +171,7 @@ def test_single_instance(instance_info, optima_dict, model_load_path, args):
         'turn_to_cluster_strategy': turn_to_cluster_strategy,
         'random_insertion': args.random_insertion if hasattr(args, 'random_insertion') else False,
         'use_rtdl_sampling': bool(args.use_rtdl_sampling) if hasattr(args, 'use_rtdl_sampling') else False,
-        'rtdl_sampling_window': args.rtdl_sampling_window if hasattr(args, 'rtdl_sampling_window') else 2,
+        'rtdl_sampling_window': args.rtdl_sampling_window if hasattr(args, 'rtdl_sampling_window') else 0,
         'rtdl_sampling_temperature': args.rtdl_sampling_temperature if hasattr(args, 'rtdl_sampling_temperature') else 1.0,
         'rtdl_sampling_topk_frac': args.rtdl_sampling_topk_frac if hasattr(args, 'rtdl_sampling_topk_frac') else 0.05,
         'rtdl_sampling_topk_min': args.rtdl_sampling_topk_min if hasattr(args, 'rtdl_sampling_topk_min') else 20,
@@ -268,7 +268,12 @@ def main():
     parser.add_argument("--coor_norm", type=int, default=0, help="Coordinate normalization")
     parser.add_argument("--with_RTDL", type=int, default=0, help="Use RTDL features (1=True, 0=False)")
     parser.add_argument("--use_rtdl_sampling", type=int, default=0, help="Use RTDL-based vertex sampling for RRC (1=True, 0=False)")
-    parser.add_argument("--rtdl_sampling_window", type=int, default=4, help="Number of edges left/right to consider for RTDL sampling")
+    parser.add_argument(
+        "--rtdl_sampling_window",
+        type=int,
+        default=0,
+        help="Must be 0: cluster RTDL only (tour-index window mode removed).",
+    )
     parser.add_argument(
         "--rtdl_sampling_temperature",
         type=float,
@@ -282,10 +287,7 @@ def main():
         type=str,
         default="sum",
         choices=["sum", "mean"],
-        help=(
-            "How to aggregate RTDL edge weights in cluster mode "
-            "(used only when --rtdl_sampling_window 0)."
-        ),
+        help="How to aggregate RTDL edge weights in cluster mode (sum or mean).",
     )
     parser.add_argument("--rtdl_sampling_log_every", type=int, default=50, help="Log RTDL sampling diagnostics every N calls (<=0 disables periodic logs, first 3 still logged)")
     parser.add_argument("--model_path", type=str, default=model_load_path, help="Path to model checkpoint")
@@ -299,7 +301,11 @@ def main():
         raise ValueError("--rtdl_sampling_topk_frac must be in (0, 1]")
     if args.rtdl_sampling_topk_min < 1:
         raise ValueError("--rtdl_sampling_topk_min must be >= 1")
-    
+    if args.rtdl_sampling_window != 0:
+        raise ValueError(
+            "--rtdl_sampling_window must be 0 (cluster RTDL only; tour-index window mode removed)."
+        )
+
     # Determine RTDL status for folder naming
     use_rtdl = bool(args.with_RTDL) if hasattr(args, 'with_RTDL') else False
     use_rtdl_sampling = bool(args.use_rtdl_sampling) if hasattr(args, 'use_rtdl_sampling') else False

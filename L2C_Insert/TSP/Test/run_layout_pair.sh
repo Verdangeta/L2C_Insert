@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Backward-compatible alias for the generic layout runner.
-# Explosion remains the default via ACTIVE_CONFIG.
+# Generic wrapper around run_layout_experiments.py.
+# Keeps shell UX stable while supporting multiple instance layouts.
 
 ACTIVE_CONFIG="${ACTIVE_CONFIG:-explosion_2k_default}"
 REGENERATE_INSTANCES=0
@@ -36,7 +36,8 @@ if [[ "${CONDA_DEFAULT_ENV:-}" != "TDA_L2C" ]] && command -v conda >/dev/null 2>
   set -u
 fi
 
-bash "$SCRIPT_DIR/run_layout_pair.sh" \
+echo "Using config preset: $ACTIVE_CONFIG"
+python -u "$SCRIPT_DIR/run_layout_experiments.py" \
   --config "$ACTIVE_CONFIG" \
   --regenerate "$REGENERATE_INSTANCES" \
   "${EXTRA_ARGS[@]}"

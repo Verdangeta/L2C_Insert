@@ -28,6 +28,11 @@ from torch.distributions import Exponential
 from L2C_Insert.TSP.utils.utils import create_logger, copy_all_src, set_result_folder
 from L2C_Insert.TSP.Test.TSPTester_repair import TSPTester as Tester
 from L2C_Insert.TSP.Test.TSPEnv import TSPEnv
+from L2C_Insert.TSP.Test.layout_registry import (
+    LAYOUT_SPECS,
+    build_generation_metadata,
+    create_default_layout_metadata,
+)
 import argparse
 
 # Try to import scipy for MST computation, fallback if not available
@@ -187,6 +192,7 @@ def generate_implosion_points(
     range_max=0.5,
     seed=None,
     num_centers=1,
+    return_metadata=False,
 ):
     """
     Generate n_points with implosion distribution (attraction regions).
@@ -217,6 +223,7 @@ def generate_implosion_points(
     # Generate uniformly distributed points
     tsp_instance = torch.rand((n_points, 2))
 
+    implosion_regions = []
     for _ in range(num_centers):
         # Select implosion center
         implosion_center = torch.rand(2)
@@ -231,17 +238,246 @@ def generate_implosion_points(
         distances = pointer_vector.norm(dim=1)
         imploded = distances < implosion_range
 
-        # Keep behavior aligned with INViT's generate_implosion_tsp_instance
-        implosion_factor = torch.minimum(implosion_range, torch.normal(0, 1, (1,)))
+        # Keep implosion strictly contractive.
+        # The previous `min(range, N(0,1))` could become negative and large in magnitude,
+        # which flips points across center and may push them far outside attraction regions.
+        raw_factor = torch.abs(torch.normal(0, 1, (1,)))
+        implosion_factor = torch.minimum(implosion_range, raw_factor)
         implosion_movement = pointer_vector * implosion_factor
 
         # Apply implosion to points within range
         tsp_instance[imploded] = implosion_center + implosion_movement[imploded]
+        implosion_regions.append((implosion_center.clone(), implosion_range.clone()))
 
-    # Normalize to unit board [0,1] x [0,1]
-    normalized = normalize_tsp_to_unit_board(tsp_instance)
+    # For implosion we keep points in the original [0,1]^2 frame.
+    # Re-normalizing after strong iterative contractions artificially stretches
+    # tiny clouds back to the full square and visually breaks geometry.
+    coords = tsp_instance.numpy().astype(np.float32)
+    if not return_metadata:
+        return coords
 
-    return normalized.numpy().astype(np.float32)
+    regions = []
+    for center_orig, radius_orig in implosion_regions:
+        center_x = float(center_orig[0].item())
+        center_y = float(center_orig[1].item())
+        radius = float(radius_orig.item())
+        regions.append({
+            "center": [center_x, center_y],
+            "radius": radius,
+            "radius_x": radius,
+            "radius_y": radius,
+        })
+    metadata = {
+        "implosion_regions": regions,
+        "normalization": {
+            "min_coords": [0.0, 0.0],
+            "max_coords": [1.0, 1.0],
+        },
+    }
+    return coords, metadata
+
+
+def generate_clustered_points(
+    n_points,
+    range_min=0.05,
+    range_max=0.2,
+    seed=None,
+    num_centers=20,
+    cluster_boundary_gap=0.1,
+    return_metadata=False,
+):
+    """
+    Generate clustered TSP points with fixed number of clusters and random radii.
+
+    Each cluster has:
+    - random center in [0,1]^2
+    - random radius in [range_min, range_max]
+    Points are sampled uniformly inside each disk (sqrt trick for radial sampling).
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+    if num_centers < 1:
+        raise ValueError("num_centers must be >= 1")
+    if range_min <= 0 or range_max <= 0:
+        raise ValueError("range_min and range_max must be > 0")
+    if range_max < range_min:
+        raise ValueError("range_max must be >= range_min")
+    if cluster_boundary_gap < 0:
+        raise ValueError("cluster_boundary_gap must be >= 0")
+
+    radii = torch.empty(num_centers).uniform_(range_min, range_max)
+    placement_gap = float(cluster_boundary_gap)
+    min_radius = range_min * 0.35
+    max_layout_restarts = 120
+    per_center_trials = 1200
+
+    centers = None
+    radii_used = radii.clone()
+    packed_ok = False
+    successful_restart = None
+    successful_shrink = None
+    for restart in range(max_layout_restarts):
+        if restart == 0:
+            shrink = 1.0
+            cur_radii = radii.clone()
+        else:
+            # If random packing fails, gradually relax radii while preserving diversity.
+            shrink = 0.97 ** restart
+            cur_radii = torch.clamp(radii * shrink, min=min_radius, max=range_max)
+
+        order = torch.randperm(num_centers)
+        placed = []
+        failed = False
+        for idx_in_order in order.tolist():
+            radius = float(cur_radii[idx_in_order].item())
+            x_lo, x_hi = radius, 1.0 - radius
+            y_lo, y_hi = radius, 1.0 - radius
+            if x_lo > x_hi or y_lo > y_hi:
+                failed = True
+                break
+
+            accepted_center = None
+            for _ in range(per_center_trials):
+                cand = torch.tensor([
+                    random.uniform(x_lo, x_hi),
+                    random.uniform(y_lo, y_hi),
+                ], dtype=torch.float32)
+                ok = True
+                for prev_idx, prev_center, prev_radius in placed:
+                    min_sep = radius + prev_radius + placement_gap
+                    if torch.norm(cand - prev_center).item() < min_sep:
+                        ok = False
+                        break
+                if ok:
+                    accepted_center = cand
+                    break
+            if accepted_center is None:
+                failed = True
+                break
+            placed.append((idx_in_order, accepted_center, radius))
+
+        if failed:
+            continue
+
+        centers = torch.zeros((num_centers, 2), dtype=torch.float32)
+        radii_used = cur_radii.clone()
+        for idx_center, center_tensor, _ in placed:
+            centers[idx_center] = center_tensor
+        packed_ok = True
+        successful_restart = restart
+        successful_shrink = shrink
+        break
+
+    if not packed_ok:
+        raise RuntimeError(
+            "Failed to generate non-overlapping clustered layout after "
+            f"{max_layout_restarts} attempts "
+            f"(num_centers={num_centers}, range_min={range_min}, "
+            f"range_max={range_max}, min_radius={min_radius}, "
+            f"placement_gap={placement_gap}, per_center_trials={per_center_trials}). "
+            "Reduce num_centers/range_max/range_min or increase the unit-square area."
+        )
+
+    min_pair_margin = float("inf")
+    for i in range(num_centers):
+        for j in range(i + 1, num_centers):
+            dist = torch.norm(centers[i] - centers[j]).item()
+            required = float(radii_used[i].item() + radii_used[j].item() + placement_gap)
+            margin = dist - required
+            min_pair_margin = min(min_pair_margin, margin)
+            if margin < -1e-7:
+                raise RuntimeError(
+                    "Clustered layout invariant violated: generated clusters overlap "
+                    f"(i={i}, j={j}, distance={dist}, required={required})."
+                )
+    if min_pair_margin == float("inf"):
+        min_pair_margin = None
+
+    probs = torch.ones(num_centers) / float(num_centers)
+    counts = torch.multinomial(probs, n_points, replacement=True).bincount(minlength=num_centers)
+
+    points = []
+    cluster_regions = []
+    for idx in range(num_centers):
+        k = int(counts[idx].item())
+        center = centers[idx]
+        radius = radii_used[idx]
+        cluster_regions.append({
+            "center": [float(center[0].item()), float(center[1].item())],
+            "radius": float(radius.item()),
+            "radius_x": float(radius.item()),
+            "radius_y": float(radius.item()),
+        })
+        if k == 0:
+            continue
+        accepted = []
+        remaining = k
+        # Rejection sampling: keep only points that are both inside the disk
+        # and inside the unit square, without geometry-distorting clamping.
+        while remaining > 0:
+            batch = max(remaining * 2, 16)
+            theta = 2.0 * np.pi * torch.rand(batch)
+            radial = torch.sqrt(torch.rand(batch)) * radius
+            x = center[0] + radial * torch.cos(theta)
+            y = center[1] + radial * torch.sin(theta)
+            pts = torch.stack([x, y], dim=1)
+            inside_unit = (
+                (pts[:, 0] >= 0.0) & (pts[:, 0] <= 1.0) &
+                (pts[:, 1] >= 0.0) & (pts[:, 1] <= 1.0)
+            )
+            valid = pts[inside_unit]
+            if valid.shape[0] > 0:
+                take = min(remaining, int(valid.shape[0]))
+                accepted.append(valid[:take])
+                remaining -= take
+        points.append(torch.cat(accepted, dim=0))
+
+    if points:
+        tsp_instance = torch.cat(points, dim=0)
+        if tsp_instance.shape[0] != n_points:
+            raise RuntimeError(
+                "Clustered point generation invariant violated: sampled "
+                f"{tsp_instance.shape[0]} points, expected {n_points}."
+            )
+    else:
+        raise RuntimeError("Clustered point generation produced no cluster points.")
+
+    coords = tsp_instance.numpy().astype(np.float32)
+    if not return_metadata:
+        return coords
+
+    metadata = {
+        "cluster_regions": cluster_regions,
+        "cluster_packing": {
+            "non_overlapping_target": True,
+            "placement_gap": float(placement_gap),
+            "packed_successfully": bool(packed_ok),
+            "max_layout_restarts": int(max_layout_restarts),
+            "successful_restart": int(successful_restart),
+            "successful_shrink": float(successful_shrink),
+            "min_pair_margin": None if min_pair_margin is None else float(min_pair_margin),
+            "original_radius_min": float(radii.min().item()),
+            "original_radius_max": float(radii.max().item()),
+            "used_radius_min": float(radii_used.min().item()),
+            "used_radius_max": float(radii_used.max().item()),
+            "min_radius": float(min_radius),
+        },
+        "normalization": {
+            "min_coords": [0.0, 0.0],
+            "max_coords": [1.0, 1.0],
+        },
+    }
+    return coords, metadata
+
+
+LAYOUT_GENERATORS = {
+    "explosion": generate_explosion_points,
+    "implosion": generate_implosion_points,
+    "clustered": generate_clustered_points,
+}
 
 
 def compute_euclidean_distance_matrix(coords):
@@ -488,56 +724,8 @@ def load_explosion_metadata(instance_path):
 
 
 def create_default_explosion_metadata(args, coords):
-    """
-    Create default explosion metadata from command line arguments.
-    Used when loading instances without saved metadata.
-    
-    Args:
-        args: Command line arguments
-        coords: numpy array of shape (n_points, 2)
-        
-    Returns:
-        Dict with generation metadata
-    """
-    if args.layout != 'explosion':
-        return None
-    
-    # Create a simple default explosion region in the center
-    # This is a fallback - ideally metadata should be saved with instances
-    n_points = len(coords)
-    avg_range = (args.range_min + args.range_max) / 2.0
-    
-    explosion_regions = []
-    for i in range(args.num_centers):
-        # Distribute centers evenly if multiple
-        if args.num_centers > 1:
-            angle = 2 * np.pi * i / args.num_centers
-            radius_offset = 0.2
-            center = [
-                0.5 + radius_offset * np.cos(angle),
-                0.5 + radius_offset * np.sin(angle)
-            ]
-        else:
-            center = [0.5, 0.5]  # Center of unit board
-        explosion_regions.append({
-            "center": center,
-            "radius": float(avg_range),
-        })
-    
-    metadata = {
-        "layout": args.layout,
-        "seed": None,  # Unknown when loading
-        "range_min": float(args.range_min),
-        "range_max": float(args.range_max),
-        "rate": float(args.rate) if args.layout == "explosion" else None,
-        "num_centers": int(args.num_centers),
-        "explosion_regions": explosion_regions,
-        "normalization": {
-            "min_coords": [0.0, 0.0],  # Assumed normalized
-            "max_coords": [1.0, 1.0],
-        },
-    }
-    return metadata
+    """Backward-compatible alias for layout-aware metadata fallback."""
+    return create_default_layout_metadata(args, coords)
 
 
 def create_tsplib_format_file_explosion(
@@ -549,6 +737,7 @@ def create_tsplib_format_file_explosion(
     concorde_scale=1000000,
     concorde_timeout_sec=300,
     reference_cache_dir=None,
+    use_reference_cache=True,
 ):
     """
     Create a file in the format expected by make_tsplib_data.
@@ -584,7 +773,12 @@ def create_tsplib_format_file_explosion(
     if reference_cache_dir:
         cache_path = os.path.join(reference_cache_dir, f"{instance_name}_reference.json")
 
-    if cache_path and optimal_cost_method in ('concorde', 'auto') and os.path.exists(cache_path):
+    if (
+        cache_path and
+        use_reference_cache and
+        optimal_cost_method in ('concorde', 'auto') and
+        os.path.exists(cache_path)
+    ):
         try:
             with open(cache_path, 'r') as f:
                 cached = json.load(f)
@@ -715,6 +909,8 @@ def build_instances_pool_name(args, problem_sizes):
     )
     if args.layout == "explosion":
         base += f"_rate{_float_tag(args.rate)}"
+    if args.layout == "clustered":
+        base += f"_gap{_float_tag(args.cluster_boundary_gap)}"
     return base
 
 
@@ -728,6 +924,7 @@ def save_instances_pool_config(instances_dir, args, problem_sizes):
         'range_min': float(args.range_min),
         'range_max': float(args.range_max),
         'rate': float(args.rate),
+        'cluster_boundary_gap': float(args.cluster_boundary_gap),
         'seed': args.seed,
         'pool_name': args.instances_pool_name,
     }
@@ -767,7 +964,7 @@ def test_single_explosion_instance(instance_info, model_load_path, args, result_
         'turn_to_cluster_strategy': turn_to_cluster_strategy,
         'random_insertion': args.random_insertion if hasattr(args, 'random_insertion') else False,
         'use_rtdl_sampling': bool(args.use_rtdl_sampling) if hasattr(args, 'use_rtdl_sampling') else False,
-        'rtdl_sampling_window': args.rtdl_sampling_window if hasattr(args, 'rtdl_sampling_window') else 2,
+        'rtdl_sampling_window': args.rtdl_sampling_window if hasattr(args, 'rtdl_sampling_window') else 0,
         'rtdl_sampling_temperature': args.rtdl_sampling_temperature if hasattr(args, 'rtdl_sampling_temperature') else 1.0,
         'rtdl_sampling_topk_frac': args.rtdl_sampling_topk_frac if hasattr(args, 'rtdl_sampling_topk_frac') else 0.05,
         'rtdl_sampling_topk_min': args.rtdl_sampling_topk_min if hasattr(args, 'rtdl_sampling_topk_min') else 20,
@@ -776,6 +973,24 @@ def test_single_explosion_instance(instance_info, model_load_path, args, result_
             if hasattr(args, 'rtdl_sampling_cluster_score_reduction')
             else 'sum'
         ),
+        'rtdl_sampling_multi_center': bool(args.rtdl_sampling_multi_center) if hasattr(args, 'rtdl_sampling_multi_center') else False,
+        'rtdl_sampling_edge_multi': bool(args.rtdl_sampling_edge_multi) if hasattr(args, 'rtdl_sampling_edge_multi') else False,
+        'rtdl_sampling_rtdl_edge': bool(args.rtdl_sampling_rtdl_edge) if hasattr(args, 'rtdl_sampling_rtdl_edge') else False,
+        'rtdl_sampling_edge_selection': (
+            args.rtdl_sampling_edge_selection if hasattr(args, 'rtdl_sampling_edge_selection') else 'softmax'
+        ),
+        'rtdl_sampling_edge_target_ess_ratio': (
+            args.rtdl_sampling_edge_target_ess_ratio
+            if hasattr(args, 'rtdl_sampling_edge_target_ess_ratio')
+            else -1.0
+        ),
+        'rtdl_sampling_forbid_removed_edges': (
+            bool(args.rtdl_sampling_forbid_removed_edges)
+            if hasattr(args, 'rtdl_sampling_forbid_removed_edges')
+            else False
+        ),
+        'rtdl_sampling_multi_local_k_min': args.rtdl_sampling_multi_local_k_min if hasattr(args, 'rtdl_sampling_multi_local_k_min') else 4,
+        'rtdl_sampling_multi_local_k_max': args.rtdl_sampling_multi_local_k_max if hasattr(args, 'rtdl_sampling_multi_local_k_max') else 20,
         'rtdl_sampling_log_every': args.rtdl_sampling_log_every if hasattr(args, 'rtdl_sampling_log_every') else 50,
         'skip_baselines': bool(args.skip_baselines) if hasattr(args, 'skip_baselines') else False,
     }
@@ -895,11 +1110,8 @@ def main():
     parser.add_argument(
         "--rtdl_sampling_window",
         type=int,
-        default=5,
-        help=(
-            "RTDL vertex scoring mode: >0 uses tour-window scoring (sum of left/right edge weights), "
-            "0 uses cluster scoring (sum over k-nearest-neighbor edge weights, k=length_sub)"
-        ),
+        default=0,
+        help="Must be 0: geometric cluster RTDL scoring only (tour-index window mode removed).",
     )
     parser.add_argument(
         "--rtdl_sampling_temperature",
@@ -928,10 +1140,66 @@ def main():
         type=str,
         default="sum",
         choices=["sum", "mean"],
+        help="How to aggregate RTDL edge weights in cluster mode (sum or mean).",
+    )
+    parser.add_argument(
+        "--rtdl_sampling_multi_center",
+        type=int,
+        default=0,
+        help="Enable multi-center global-local destroy sampling (1=True, 0=False).",
+    )
+    parser.add_argument(
+        "--rtdl_sampling_edge_multi",
+        type=int,
+        default=0,
+        help="Enable edge-first multi destroy sampling (1=True, 0=False).",
+    )
+    parser.add_argument(
+        "--rtdl_sampling_rtdl_edge",
+        type=int,
+        default=0,
         help=(
-            "How to aggregate RTDL edge weights in cluster mode "
-            "(used only when --rtdl_sampling_window 0)."
+            "Enable rtdl_edge destroy: sample RTDL-heavy tour edges; spend destroy budget on "
+            "alternating nearest tour positions to the two endpoint nodes (not used with multi_center/edge_multi)."
         ),
+    )
+    parser.add_argument(
+        "--rtdl_sampling_edge_selection",
+        type=str,
+        default="softmax",
+        choices=["softmax", "greedy"],
+        help="How to pick edges in multi_edge and rtdl_edge modes.",
+    )
+    parser.add_argument(
+        "--rtdl_sampling_edge_target_ess_ratio",
+        type=float,
+        default=-1.0,
+        help=(
+            "Optional target ESS ratio in edge softmax sampling. "
+            "If >0, adapt per-step effective temperature to match this concentration target; "
+            "if <=0, use fixed --rtdl_sampling_temperature."
+        ),
+    )
+    parser.add_argument(
+        "--rtdl_sampling_forbid_removed_edges",
+        type=int,
+        default=0,
+        help=(
+            "When enabled in multi_edge, forbid reinserting removed sampled edges "
+            "(undirected) during the current destroy/repair cycle."
+        ),
+    )
+    parser.add_argument(
+        "--rtdl_sampling_multi_local_k_min",
+        type=int,
+        default=4,
+        help="Minimum local neighborhood size sampled per touch in multi-center mode.",
+    )
+    parser.add_argument(
+        "--rtdl_sampling_multi_local_k_max",
+        type=int,
+        default=20,
+        help="Maximum local neighborhood size sampled per touch in multi-center mode.",
     )
     parser.add_argument("--rtdl_sampling_log_every", type=int, default=50, help="Log RTDL sampling diagnostics every N calls (<=0 disables periodic logs, first 3 still logged)")
     parser.add_argument("--model_path", type=str, default=model_load_path, help="Path to model checkpoint")
@@ -999,12 +1267,18 @@ def main():
     # Instance generation parameters
     parser.add_argument("--range_min", type=float, default=DEFAULT_RANGE_MIN, help="Minimum range of local effect")
     parser.add_argument("--range_max", type=float, default=DEFAULT_RANGE_MAX, help="Maximum range of local effect")
+    parser.add_argument(
+        "--cluster_boundary_gap",
+        type=float,
+        default=0.005,
+        help="Minimum gap between clustered region boundaries (edge-to-edge)",
+    )
     parser.add_argument("--rate", type=float, default=DEFAULT_RATE, help="Exponential rate for explosion mode")
     parser.add_argument(
         "--layout",
         type=str,
         default="explosion",
-        choices=["explosion", "implosion"],
+        choices=sorted(LAYOUT_SPECS.keys()),
         help="Instance layout generation mode",
     )
     parser.add_argument(
@@ -1024,18 +1298,52 @@ def main():
         raise ValueError("--rtdl_sampling_topk_frac must be in (0, 1]")
     if args.rtdl_sampling_topk_min < 1:
         raise ValueError("--rtdl_sampling_topk_min must be >= 1")
-    if args.rtdl_sampling_window < 0:
-        raise ValueError("--rtdl_sampling_window must be >= 0 (0=cluster mode, >0=window mode)")
+    if args.rtdl_sampling_window != 0:
+        raise ValueError(
+            "--rtdl_sampling_window must be 0 (cluster RTDL only; tour-index window mode removed)."
+        )
     if args.rtdl_sampling_cluster_score_reduction not in ("sum", "mean"):
         raise ValueError("--rtdl_sampling_cluster_score_reduction must be one of: sum, mean")
+    if args.rtdl_sampling_multi_local_k_min < 1:
+        raise ValueError("--rtdl_sampling_multi_local_k_min must be >= 1")
+    if args.rtdl_sampling_multi_local_k_max < args.rtdl_sampling_multi_local_k_min:
+        raise ValueError("--rtdl_sampling_multi_local_k_max must be >= --rtdl_sampling_multi_local_k_min")
+    if args.rtdl_sampling_edge_selection not in ("softmax", "greedy"):
+        raise ValueError("--rtdl_sampling_edge_selection must be one of: softmax, greedy")
+    if args.rtdl_sampling_edge_target_ess_ratio > 1.0:
+        raise ValueError("--rtdl_sampling_edge_target_ess_ratio must be <= 1")
+    _rtdl_modes = (
+        int(bool(args.rtdl_sampling_multi_center))
+        + int(bool(args.rtdl_sampling_edge_multi))
+        + int(bool(args.rtdl_sampling_rtdl_edge))
+    )
+    if _rtdl_modes > 1:
+        raise ValueError(
+            "At most one of --rtdl_sampling_multi_center, --rtdl_sampling_edge_multi, "
+            "--rtdl_sampling_rtdl_edge can be enabled (1)."
+        )
     if args.num_centers < 1:
         raise ValueError("--num_centers must be >= 1")
+    if args.cluster_boundary_gap < 0:
+        raise ValueError("--cluster_boundary_gap must be >= 0")
     
     # Determine RTDL status for folder naming
     use_rtdl = bool(args.with_RTDL)
     use_rtdl_sampling = bool(args.use_rtdl_sampling)
+    use_multi_center_sampling = bool(args.rtdl_sampling_multi_center) and use_rtdl_sampling
+    use_edge_multi_sampling = bool(args.rtdl_sampling_edge_multi) and use_rtdl_sampling
+    use_rtdl_edge_sampling = bool(args.rtdl_sampling_rtdl_edge) and use_rtdl_sampling
     rtdl_suffix = '_RTDL' if use_rtdl else '_noRTDL'
-    rtdl_sampling = '_advance_sampling' if use_rtdl_sampling else ''
+    if use_rtdl_edge_sampling:
+        rtdl_sampling = f"_advance_sampling_rtdl_edge_{args.rtdl_sampling_edge_selection}"
+    elif use_edge_multi_sampling:
+        rtdl_sampling = f"_advance_sampling_multi_edge_{args.rtdl_sampling_edge_selection}"
+    elif use_multi_center_sampling:
+        rtdl_sampling = '_advance_sampling_multi'
+    elif use_rtdl_sampling:
+        rtdl_sampling = '_advance_sampling_single'
+    else:
+        rtdl_sampling = '_proximity_sampling'
     sizes_tag = f"{min(problem_sizes)}-{max(problem_sizes)}" if len(problem_sizes) > 1 else str(problem_sizes[0])
     run_desc = (
         f"test_{args.layout}_c{args.num_centers}_n{args.num_instances}_"
@@ -1073,7 +1381,8 @@ def main():
     print(
         f"Generation parameters: layout={args.layout}, "
         f"range_min={args.range_min}, range_max={args.range_max}, "
-        f"rate={args.rate}, num_centers={args.num_centers}"
+        f"rate={args.rate}, num_centers={args.num_centers}, "
+        f"cluster_boundary_gap={args.cluster_boundary_gap}"
     )
     print(f"Optimal cost method: {args.optimal_cost_method}")
     print(f"Results will be saved to: {result_folder}")
@@ -1125,10 +1434,11 @@ def main():
                         # Create default metadata from command line arguments
                         generation_metadata = create_default_explosion_metadata(args, coords)
                         if generation_metadata:
-                            print(f"Note: Using default explosion metadata for {instance_name} (metadata file not found)")
+                            print(f"Note: Using default layout metadata for {instance_name} (metadata file not found)")
                     
                     tsplib_path = os.path.join(result_folder, 'instances', f"{instance_name}_formatted.txt")
                     os.makedirs(os.path.dirname(tsplib_path), exist_ok=True)
+                    reference_cache_dir = source_instances_dir
                     reference_metadata = create_tsplib_format_file_explosion(
                         coords,
                         tsplib_path,
@@ -1137,7 +1447,8 @@ def main():
                         concorde_cmd=args.concorde_cmd,
                         concorde_scale=args.concorde_scale,
                         concorde_timeout_sec=args.concorde_timeout_sec,
-                        reference_cache_dir=source_instances_dir,
+                        reference_cache_dir=reference_cache_dir,
+                        use_reference_cache=not bool(args.regenerate_instances),
                     )
                     all_instances.append({
                         'name': instance_name,
@@ -1166,34 +1477,28 @@ def main():
                 seed = base_seed + instance_counter if args.seed is not None else None
                 
                 # Generate points with requested distribution
-                if args.layout == "explosion":
-                    coords, explosion_meta = generate_explosion_points(
-                        size,
-                        range_min=args.range_min,
-                        range_max=args.range_max,
-                        rate=args.rate,
-                        seed=seed,
-                        num_centers=args.num_centers,
-                        return_metadata=True,
-                    )
-                else:
-                    coords = generate_implosion_points(
-                        size,
-                        range_min=args.range_min,
-                        range_max=args.range_max,
-                        seed=seed,
-                        num_centers=args.num_centers,
-                    )
-                generation_metadata = {
-                    "layout": args.layout,
+                generator = LAYOUT_GENERATORS[args.layout]
+                generator_kwargs = {
+                    "range_min": args.range_min,
+                    "range_max": args.range_max,
                     "seed": seed,
-                    "range_min": float(args.range_min),
-                    "range_max": float(args.range_max),
-                    "rate": float(args.rate) if args.layout == "explosion" else None,
-                    "num_centers": int(args.num_centers),
+                    "num_centers": args.num_centers,
+                    "return_metadata": True,
                 }
                 if args.layout == "explosion":
-                    generation_metadata.update(explosion_meta)
+                    generator_kwargs["rate"] = args.rate
+                if args.layout == "clustered":
+                    generator_kwargs["cluster_boundary_gap"] = args.cluster_boundary_gap
+                coords, layout_metadata = generator(size, **generator_kwargs)
+                generation_metadata = build_generation_metadata(
+                    layout=args.layout,
+                    seed=seed,
+                    range_min=args.range_min,
+                    range_max=args.range_max,
+                    rate=args.rate,
+                    num_centers=args.num_centers,
+                    layout_metadata=layout_metadata,
+                )
                 
                 # Save instance with metadata
                 if source_instances_dir:
@@ -1203,6 +1508,7 @@ def main():
                 
                 # Create formatted file for TSPEnv
                 tsplib_path = os.path.join(result_folder, 'instances', f"{instance_name}_formatted.txt")
+                reference_cache_dir = source_instances_dir
                 reference_metadata = create_tsplib_format_file_explosion(
                     coords,
                     tsplib_path,
@@ -1211,7 +1517,8 @@ def main():
                     concorde_cmd=args.concorde_cmd,
                     concorde_scale=args.concorde_scale,
                     concorde_timeout_sec=args.concorde_timeout_sec,
-                    reference_cache_dir=source_instances_dir,
+                    reference_cache_dir=reference_cache_dir,
+                    use_reference_cache=not bool(args.regenerate_instances),
                 )
                 
                 all_instances.append({
